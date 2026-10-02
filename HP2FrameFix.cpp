@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.10
+// HP2FrameFix.asi  v0.11
 // Frame pacing, game clock fix, EAX-on-startup fix and loading speed-up
 // for Need for Speed: Hot Pursuit 2 (PC)
 //
@@ -6,6 +6,15 @@
 // (SHA-1 63147101c2ca814e964f31c06730b1292093d7f4, PE timestamp 0x3DDDE96C).
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
+//
+// Changes from v0.10:
+//  - smoothCharacterAnims: the per-physics-step world update (0x4D00A0) only
+//    runs character actors (drivers, cops, dog, the busted driver) on odd
+//    steps - "and bl, 1" - so every character animated at 30 Hz. The ASI now
+//    also runs the actor UpdateAll (0x406FB0) on even steps, hooked at the
+//    call at 0x4D0217. Other odd-step-only systems (particles etc.) keep their
+//    original rate. Animation advances by elapsed steps, so speed is unchanged.
+//  - Removed the experimental camera probe.
 //
 // Changes from v0.9:
 //  - Animation clock rewrite (AnimChannelSet::Advance, 0x545030). Character
@@ -89,7 +98,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.10"
+#define HP2FF_VERSION "0.11"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -127,6 +136,10 @@ namespace hp2 {
         { 0x42E810,       "\xD8\x25\x24\xD8\x65\x00", 6 },            // fsub [0.1]
         { 0x545030,       "\x55\x8B\xEC\x51\x8A\x41\x08\x53\x32\xDB", 10 }, // AnimChannelSet::Advance
         { 0x54504E,       "\x8B\x15\xDC\x21\x72\x00", 6 },            // mov edx,[stepCounter]
+        { 0x4D00A9,       "\x8A\x5D\x08\xB1\x01\x22\xD9", 7 },         // bl = step & 1
+        { 0x4D0217,       "\xE8\x34\xA6\xFF\xFF", 5 },                 // call 0x4CA850
+        { 0x4D021C,       "\x84\xDB\x74\x35", 4 },                      // test bl,bl / je skip
+        { 0x406FB0,       "\x8B\x49\x5C\x85\xC9\x74\x05", 7 },         // ActorList::UpdateAll wrapper
     };
 }
 
@@ -144,7 +157,7 @@ struct Config {
     int   smoothSlowMotionAnims = 1;
     int   fixDriverShiftAnim   = 1;
     int   animDiag             = 0;
-    int   camDiag              = 0;     // 1 = camera update pattern, 2 = + writer call chains
+    int   smoothCharacterAnims = 1;
     float tickPhase            = 0.75f; // where ticks sit inside each tick slot after a frame deadline
     int   fixEAXOnStartup      = 1;
     int   eaxFixStableFrames   = 90;    // frames the bad state must persist first
@@ -212,10 +225,10 @@ static void LoadConfig() {
                 "smoothSlowMotionAnims=1\n"
                 "; stop the gear-shift animation from being cancelled by a stale flag\n"
                 "fixDriverShiftAnim=1\n"
+                "; update characters (drivers, cops, dog) every physics step instead of every other\n"
+                "smoothCharacterAnims=1\n"
                 "; log per-character animation update rates (diagnostics)\n"
                 "animDiag=0\n"
-                "; log camera update pattern (1) and which code writes it (2)\n"
-                "camDiag=0\n"
                 "; --- EAX: re-apply saved EAX mode after startup ---\n"
                 "fixEAXOnStartup=1\n"
                 "eaxFixStableFrames=90\n"
@@ -246,7 +259,7 @@ static void LoadConfig() {
         else if (!_stricmp(key, "smoothSlowMotionAnims")) g_cfg.smoothSlowMotionAnims = atoi(val);
         else if (!_stricmp(key, "fixDriverShiftAnim"))   g_cfg.fixDriverShiftAnim = atoi(val);
         else if (!_stricmp(key, "animDiag"))             g_cfg.animDiag = atoi(val);
-        else if (!_stricmp(key, "camDiag"))              g_cfg.camDiag = atoi(val);
+        else if (!_stricmp(key, "smoothCharacterAnims")) g_cfg.smoothCharacterAnims = atoi(val);
         else if (!_stricmp(key, "tickPhase"))            g_cfg.tickPhase = (float)atof(val);
         else if (!_stricmp(key, "fixEAXOnStartup"))      g_cfg.fixEAXOnStartup = atoi(val);
         else if (!_stricmp(key, "eaxFixStableFrames"))   g_cfg.eaxFixStableFrames = atoi(val);
@@ -290,9 +303,9 @@ static void OpenLog() {
          g_cfg.enableLimiter, g_cfg.targetFPS, g_cfg.passthrough,
          g_cfg.raiseTimerResolution, g_cfg.hiResGameTimers);
     Logf("preciseGameTicks=%d tickPhase=%.2f smoothDriverSteering=%d smoothSlowMotionAnims=%d "
-         "fixDriverShiftAnim=%d animDiag=%d camDiag=%d\n", g_cfg.preciseGameTicks, g_cfg.tickPhase,
+         "fixDriverShiftAnim=%d animDiag=%d smoothCharacterAnims=%d\n", g_cfg.preciseGameTicks, g_cfg.tickPhase,
          g_cfg.smoothDriverSteering, g_cfg.smoothSlowMotionAnims, g_cfg.fixDriverShiftAnim,
-         g_cfg.animDiag, g_cfg.camDiag);
+         g_cfg.animDiag, g_cfg.smoothCharacterAnims);
     Logf("fixEAX=%d speedUpLoading=%d loadScreenRenderMs=%d limiterDuringLoading=%d\n",
          g_cfg.fixEAXOnStartup, g_cfg.speedUpLoading, g_cfg.loadScreenRenderMs,
          g_cfg.limiterDuringLoading);
@@ -945,140 +958,32 @@ static void LogTimeScaleChanges() {
 }
 
 // ---------------------------------------------------------------------------
-// Camera diagnostics (camDiag)
+// Character actors every physics step (game only updates them on odd steps)
 // ---------------------------------------------------------------------------
-namespace hp2 { const DWORD pViewMatrixSym = 0x846678; }   // EAGL::ViewPort::gpViewMatrix
+namespace hp2 {
+    const DWORD callWorldStepMid = 0x4D0217;   // call 0x4CA850 inside WorldStep, before the odd-step block
+    const DWORD fnWorldStepMid   = 0x4CA850;   // ignores ecx, no stack args
+    const DWORD fnActorsUpdate   = 0x406FB0;   // thiscall(ActorManager*): UpdateAll
+}
+typedef void (__fastcall *ThisNoArgs_t)(void* self, void* edx);
+static std::atomic<unsigned long> g_extraActorUpdates{0};
 
-static float  g_camPrev[16];
-static bool   g_camHavePrev = false;
-static char   g_camPattern[128];
-static char   g_stepPattern[128];
-static int    g_camPatLen = 0;
-static int    g_camLastCounter = 0;
-static DWORD  g_camMatrixAddr = 0;
-
-// writer trace (camDiag=2)
-struct CamWriter { DWORD eip; DWORD chain[6]; unsigned hits; };
-static CamWriter g_camWriters[16];
-static volatile LONG g_camWriterCount = 0;
-static volatile LONG g_camWriterDropped = 0;
-static DWORD  g_mainThreadId = 0;
-static HANDLE g_mainThread = nullptr;
-static DWORD  g_watchAddr = 0;
-static PVOID  g_veh = nullptr;
-
-static bool LooksLikeReturnAddr(DWORD a) {
-    if (a < 0x401000 || a >= 0x65C000) return false;
-    const BYTE* p = reinterpret_cast<const BYTE*>(a);
-    if (IsBadReadPtr(p - 7, 7)) return false;
-    if (p[-5] == 0xE8) return true;                                  // call rel32
-    if (p[-2] == 0xFF && (p[-1] & 0x38) == 0x10) return true;         // call r/m (reg)
-    if (p[-3] == 0xFF && (p[-2] & 0x38) == 0x10) return true;         // call [r+d8]
-    if (p[-6] == 0xFF && (p[-5] & 0x38) == 0x10) return true;         // call [r+d32]/[abs]
-    return false;
+static void __fastcall Hook_WorldStepMid(void* self, void*) {
+    reinterpret_cast<ThisNoArgs_t>(hp2::fnWorldStepMid)(self, nullptr);
+    // WorldStep(step) is called with the current counter; the game updates actors
+    // when (step & 1) != 0. Fill in the even steps.
+    int step = *reinterpret_cast<volatile int*>(hp2::pStepCounter);
+    if (step & 1) return;
+    DWORD app = 0, mgr = 0;
+    if (!SafeRead(hp2::pApp, &app) || !app || !SafeRead(app + 0x30, &mgr) || !mgr) return;
+    reinterpret_cast<ThisNoArgs_t>(hp2::fnActorsUpdate)(reinterpret_cast<void*>(mgr), nullptr);
+    g_extraActorUpdates++;
 }
 
-static LONG CALLBACK CamWatchHandler(PEXCEPTION_POINTERS ep) {
-    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
-    CONTEXT* c = ep->ContextRecord;
-    if (!(c->Dr6 & 1)) return EXCEPTION_CONTINUE_SEARCH;
-    c->Dr6 = 0;
-    DWORD eip = c->Eip;
-    DWORD chain[6] = {};
-    int n = 0;
-    const DWORD* sp = reinterpret_cast<const DWORD*>(c->Esp);
-    for (int i = 0; i < 512 && n < 6; ++i) {
-        if (IsBadReadPtr(sp + i, 4)) break;
-        if (LooksLikeReturnAddr(sp[i])) chain[n++] = sp[i];
-    }
-    LONG cnt = g_camWriterCount;
-    for (LONG i = 0; i < cnt; ++i) {
-        if (g_camWriters[i].eip == eip && g_camWriters[i].chain[0] == chain[0] &&
-            g_camWriters[i].chain[1] == chain[1]) { g_camWriters[i].hits++; return EXCEPTION_CONTINUE_EXECUTION; }
-    }
-    if (cnt < 16) {
-        g_camWriters[cnt].eip = eip;
-        memcpy(g_camWriters[cnt].chain, chain, sizeof(chain));
-        g_camWriters[cnt].hits = 1;
-        g_camWriterCount = cnt + 1;
-    } else {
-        g_camWriterDropped++;
-    }
-    return EXCEPTION_CONTINUE_EXECUTION;
-}
-
-struct ArmArgs { DWORD addr; };
-static DWORD WINAPI ArmWatchThread(LPVOID param) {
-    DWORD addr = reinterpret_cast<ArmArgs*>(param)->addr;
-    if (SuspendThread(g_mainThread) == (DWORD)-1) return 1;
-    CONTEXT c = {};
-    c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    BOOL ok = GetThreadContext(g_mainThread, &c);
-    if (ok) {
-        c.Dr0 = addr;
-        // L0 enable, RW0 = 01 (write), LEN0 = 11 (4 bytes)
-        c.Dr7 = (c.Dr7 & ~0x000F0003u) | 0x1u | (0x1u << 16) | (0x3u << 18);
-        ok = SetThreadContext(g_mainThread, &c);
-    }
-    ResumeThread(g_mainThread);
-    return ok ? 0 : 2;
-}
-
-static void ArmCameraWatch(DWORD addr) {
-    if (!g_veh) g_veh = AddVectoredExceptionHandler(1, CamWatchHandler);
-    if (!g_mainThread) {
-        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_mainThread,
-                        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, 0);
-        g_mainThreadId = GetCurrentThreadId();
-    }
-    ArmArgs a = { addr };
-    HANDLE t = CreateThread(nullptr, 0, ArmWatchThread, &a, 0, nullptr);
-    DWORD rc = 99;
-    if (t) { WaitForSingleObject(t, 2000); GetExitCodeThread(t, &rc); CloseHandle(t); }
-    g_watchAddr = addr;
-    Logf("cam diag: write-watch on 0x%08lX %s\n", (unsigned long)addr,
-         rc == 0 ? "armed" : "FAILED (debug registers unavailable)");
-}
-
-static void CamDiagFrame() {
-    if (!g_cfg.camDiag || !g_knownExe) return;
-    DWORD sym = 0;
-    if (!SafeRead(hp2::pViewMatrixSym, &sym)) return;
-    // gpViewMatrix may be the matrix itself or a pointer to it.
-    DWORD m = (sym > 0x10000 && !IsBadReadPtr(reinterpret_cast<void*>(sym), 64)) ? sym : hp2::pViewMatrixSym;
-    if (m != g_camMatrixAddr) {
-        Logf("cam diag: view matrix at 0x%08lX (symbol value 0x%08lX)\n", (unsigned long)m, (unsigned long)sym);
-        g_camMatrixAddr = m; g_camHavePrev = false;
-        if (g_cfg.camDiag >= 2) ArmCameraWatch(m + 0x30);   // translation x
-    }
-    float cur[16];
-    if (IsBadReadPtr(reinterpret_cast<void*>(m), sizeof(cur))) return;
-    memcpy(cur, reinterpret_cast<void*>(m), sizeof(cur));
-    int counter = *reinterpret_cast<volatile int*>(hp2::pStepCounter);
-    if (g_camHavePrev && g_camPatLen < 120) {
-        g_camPattern[g_camPatLen] = memcmp(cur, g_camPrev, sizeof(cur)) ? 'C' : '.';
-        int d = counter - g_camLastCounter;
-        g_stepPattern[g_camPatLen] = (char)(d < 0 ? '-' : d > 9 ? '+' : '0' + d);
-        g_camPatLen++;
-    }
-    memcpy(g_camPrev, cur, sizeof(cur));
-    g_camHavePrev = true;
-    g_camLastCounter = counter;
-}
-
-static void CamDiagFlush() {
-    if (!g_cfg.camDiag || !g_camPatLen) return;
-    g_camPattern[g_camPatLen] = 0; g_stepPattern[g_camPatLen] = 0;
-    Logf("cam diag: camera %s\n          steps  %s\n", g_camPattern, g_stepPattern);
-    g_camPatLen = 0;
-    LONG n = g_camWriterCount;
-    for (LONG i = 0; i < n; ++i) {
-        const CamWriter& w = g_camWriters[i];
-        Logf("  writer eip=0x%06lX hits=%u chain:", (unsigned long)w.eip, w.hits);
-        for (int k = 0; k < 6 && w.chain[k]; ++k) Logf(" 0x%06lX", (unsigned long)w.chain[k]);
-        Logf("\n");
-        g_camWriters[i].hits = 0;
-    }
+static void InstallCharacterAnimPatch() {
+    if (!g_knownExe || !g_cfg.smoothCharacterAnims) return;
+    bool ok = PatchCallRel32(hp2::callWorldStepMid, (void*)&Hook_WorldStepMid);
+    Logf("character animation: %s\n", ok ? "actors updated every physics step (60 Hz)" : "patch FAILED");
 }
 
 static void InstallTickPatch() {
@@ -1202,12 +1107,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
         double el = QpcToMs(now - diagStart) / 1000.0;
         if (el >= 2.0) { AnimDiagFlush(el); diagStart = now; }
     }
-    if (g_cfg.camDiag) {
-        CamDiagFrame();
-        static LONGLONG camStart = 0;
-        if (!camStart) camStart = now;
-        if (QpcToMs(now - camStart) >= 2000.0) { CamDiagFlush(); camStart = now; }
-    }
+
     g_presentCount++;
     if (g_lastPresentQpc && !loading) {
         double deltaMs = QpcToMs(now - g_lastPresentQpc);
@@ -1316,6 +1216,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
         InstallTickPatch();
         InstallSteeringPatch();
         InstallAnimClockPatch();
+        InstallCharacterAnimPatch();
 
         if (PatchIAT_Direct3DCreate8())
             Logf("D3D IAT patch OK\n");
