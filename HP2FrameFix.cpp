@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.9
+// HP2FrameFix.asi  v0.10
 // Frame pacing, game clock fix, EAX-on-startup fix and loading speed-up
 // for Need for Speed: Hot Pursuit 2 (PC)
 //
@@ -6,6 +6,21 @@
 // (SHA-1 63147101c2ca814e964f31c06730b1292093d7f4, PE timestamp 0x3DDDE96C).
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
+//
+// Changes from v0.9:
+//  - Animation clock rewrite (AnimChannelSet::Advance, 0x545030). Character
+//    animations advanced in whole 60 Hz physics steps. Slow-motion cameras
+//    (e.g. the bust sequence) scale game time down to 0.25x, so the step
+//    counter - and every animation - only moved 15 times a second.
+//    smoothSlowMotionAnims advances channels by fractional steps taken from
+//    race time, so characters animate every frame at any game speed.
+//  - fixDriverShiftAnim: the driver's clip selector (0x42E6B0) treats the
+//    shift animation as finished when the channel set's "looped" flag is set.
+//    Advance left that flag untouched when no time had passed, so a stale
+//    flag (often from the steering clip) cancelled freshly started shift
+//    animations - the hand never left the wheel. The flag is now cleared
+//    whenever an update advances no time.
+//  - Log records game-speed (time scale) changes.
 //
 // Changes from v0.8:
 //  - smoothDriverSteering: the driver's steering-wheel pose (VehicleDriver,
@@ -65,6 +80,7 @@
 #include <d3d8.h>
 #include <atomic>
 #include <cstdarg>
+#include <cstddef>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -73,7 +89,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.9"
+#define HP2FF_VERSION "0.10"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -109,6 +125,8 @@ namespace hp2 {
         { 0x42E7DC,       "\x83\xC2\x03", 3 },                         // steer: every 4 steps
         { 0x42E7F9,       "\xD8\x05\x24\xD8\x65\x00", 6 },            // fadd [0.1]
         { 0x42E810,       "\xD8\x25\x24\xD8\x65\x00", 6 },            // fsub [0.1]
+        { 0x545030,       "\x55\x8B\xEC\x51\x8A\x41\x08\x53\x32\xDB", 10 }, // AnimChannelSet::Advance
+        { 0x54504E,       "\x8B\x15\xDC\x21\x72\x00", 6 },            // mov edx,[stepCounter]
     };
 }
 
@@ -123,6 +141,10 @@ struct Config {
     int   hiResGameTimers      = 1;
     int   preciseGameTicks     = 1;
     int   smoothDriverSteering = 1;
+    int   smoothSlowMotionAnims = 1;
+    int   fixDriverShiftAnim   = 1;
+    int   animDiag             = 0;
+    int   camDiag              = 0;     // 1 = camera update pattern, 2 = + writer call chains
     float tickPhase            = 0.75f; // where ticks sit inside each tick slot after a frame deadline
     int   fixEAXOnStartup      = 1;
     int   eaxFixStableFrames   = 90;    // frames the bad state must persist first
@@ -186,6 +208,14 @@ static void LoadConfig() {
                 "tickPhase=0.75\n"
                 "; update the driver's steering animation every physics step (60 Hz) instead of 15 Hz\n"
                 "smoothDriverSteering=1\n"
+                "; animate characters every frame even in slow motion (bust sequence)\n"
+                "smoothSlowMotionAnims=1\n"
+                "; stop the gear-shift animation from being cancelled by a stale flag\n"
+                "fixDriverShiftAnim=1\n"
+                "; log per-character animation update rates (diagnostics)\n"
+                "animDiag=0\n"
+                "; log camera update pattern (1) and which code writes it (2)\n"
+                "camDiag=0\n"
                 "; --- EAX: re-apply saved EAX mode after startup ---\n"
                 "fixEAXOnStartup=1\n"
                 "eaxFixStableFrames=90\n"
@@ -213,6 +243,10 @@ static void LoadConfig() {
         else if (!_stricmp(key, "hiResGameTimers"))      g_cfg.hiResGameTimers = atoi(val);
         else if (!_stricmp(key, "preciseGameTicks"))     g_cfg.preciseGameTicks = atoi(val);
         else if (!_stricmp(key, "smoothDriverSteering")) g_cfg.smoothDriverSteering = atoi(val);
+        else if (!_stricmp(key, "smoothSlowMotionAnims")) g_cfg.smoothSlowMotionAnims = atoi(val);
+        else if (!_stricmp(key, "fixDriverShiftAnim"))   g_cfg.fixDriverShiftAnim = atoi(val);
+        else if (!_stricmp(key, "animDiag"))             g_cfg.animDiag = atoi(val);
+        else if (!_stricmp(key, "camDiag"))              g_cfg.camDiag = atoi(val);
         else if (!_stricmp(key, "tickPhase"))            g_cfg.tickPhase = (float)atof(val);
         else if (!_stricmp(key, "fixEAXOnStartup"))      g_cfg.fixEAXOnStartup = atoi(val);
         else if (!_stricmp(key, "eaxFixStableFrames"))   g_cfg.eaxFixStableFrames = atoi(val);
@@ -255,8 +289,10 @@ static void OpenLog() {
     Logf("limiter=%d fps=%d passthrough=%d timerRes=%d hiResTimers=%d\n",
          g_cfg.enableLimiter, g_cfg.targetFPS, g_cfg.passthrough,
          g_cfg.raiseTimerResolution, g_cfg.hiResGameTimers);
-    Logf("preciseGameTicks=%d tickPhase=%.2f smoothDriverSteering=%d\n", g_cfg.preciseGameTicks,
-         g_cfg.tickPhase, g_cfg.smoothDriverSteering);
+    Logf("preciseGameTicks=%d tickPhase=%.2f smoothDriverSteering=%d smoothSlowMotionAnims=%d "
+         "fixDriverShiftAnim=%d animDiag=%d camDiag=%d\n", g_cfg.preciseGameTicks, g_cfg.tickPhase,
+         g_cfg.smoothDriverSteering, g_cfg.smoothSlowMotionAnims, g_cfg.fixDriverShiftAnim,
+         g_cfg.animDiag, g_cfg.camDiag);
     Logf("fixEAX=%d speedUpLoading=%d loadScreenRenderMs=%d limiterDuringLoading=%d\n",
          g_cfg.fixEAXOnStartup, g_cfg.speedUpLoading, g_cfg.loadScreenRenderMs,
          g_cfg.limiterDuringLoading);
@@ -714,6 +750,337 @@ static void InstallSteeringPatch() {
     Logf("driver steering: %s\n", ok ? "updates every physics step (60 Hz)" : "patch FAILED");
 }
 
+// ---------------------------------------------------------------------------
+// Animation clock: replacement for AnimChannelSet::Advance (0x545030)
+// ---------------------------------------------------------------------------
+namespace hp2 {
+    const DWORD fnAnimAdvance = 0x545030;
+    const DWORD pStepCounter  = 0x7221DC;   // int, 60 Hz physics steps
+    const DWORD pRaceTime     = 0x7221F0;   // float seconds, scaled by game speed
+    const DWORD pTimeScale    = 0x7221F4;   // float, 1.0 normal, <1 slow motion
+}
+
+#pragma pack(push, 1)
+struct AnimChannel {        // 0x14 bytes
+    float rate;             // +0x00 clip time per physics step
+    float time;             // +0x04
+    float prevTime;         // +0x08
+    float length;           // +0x0C
+    int   active;           // +0x10
+};
+struct AnimChannelSet {
+    int          lastStep;  // +0x00 step counter at last advance
+    int          elapsed;   // +0x04 whole steps advanced by the last call
+    BYTE         paused;    // +0x08
+    BYTE         unk9;      // +0x09
+    BYTE         looped;    // +0x0A a channel wrapped during the last call
+    BYTE         unkB;
+    AnimChannel* channels;  // +0x0C
+    int          count;     // +0x10
+};
+#pragma pack(pop)
+static_assert(sizeof(AnimChannel) == 0x14, "AnimChannel layout");
+static_assert(offsetof(AnimChannelSet, channels) == 0x0C, "AnimChannelSet layout");
+
+struct AnimClockEntry { const AnimChannelSet* key; int lastStep; double lastClock; };
+static const int kAnimClockSlots = 2048;           // power of two
+static AnimClockEntry g_animClock[kAnimClockSlots];
+static int g_animClockUsed = 0;
+static CRITICAL_SECTION g_animLock;
+
+static double GameStepClock() {
+    int   counter = *reinterpret_cast<volatile int*>(hp2::pStepCounter);
+    float rt      = *reinterpret_cast<volatile float*>(hp2::pRaceTime);
+    double frac = (double)rt * 60.0 - (double)counter;
+    if (!(frac > 0.0)) frac = 0.0;                  // also catches NaN
+    if (frac > 0.999) frac = 0.999;                 // counter capped / catching up
+    return (double)counter + frac;
+}
+
+static AnimClockEntry* AnimClockFor(const AnimChannelSet* cs) {
+    DWORD h = (reinterpret_cast<DWORD>(cs) >> 3) * 2654435761u;
+    for (int i = 0; i < kAnimClockSlots; ++i) {
+        AnimClockEntry& e = g_animClock[(h + i) & (kAnimClockSlots - 1)];
+        if (e.key == cs) return &e;
+        if (!e.key) {
+            if (g_animClockUsed > kAnimClockSlots * 3 / 4) {      // stale actors piled up
+                memset(g_animClock, 0, sizeof(g_animClock));
+                g_animClockUsed = 0;
+                return AnimClockFor(cs);
+            }
+            e.key = cs; e.lastStep = cs->lastStep; e.lastClock = cs->lastStep;
+            g_animClockUsed++;
+            return &e;
+        }
+    }
+    return nullptr;
+}
+
+// --- animation diagnostics (animDiag=1) ---
+struct AnimDiagEntry { const AnimChannelSet* cs; int animId; DWORD clipVt; float rate, length;
+                       unsigned calls, advances; double steps; };
+static AnimDiagEntry g_animDiag[32];
+static int g_animDiagCount = 0;
+static unsigned g_animDiagDropped = 0;
+
+static void AnimDiagRecord(const AnimChannelSet* cs, double steps) {
+    if (!g_cfg.animDiag) return;
+    int animId = 0; DWORD clipVt = 0; float rate = 0, length = 0;
+    const BYTE* actor = reinterpret_cast<const BYTE*>(cs) - 0x34;
+    SafeRead(reinterpret_cast<DWORD>(actor) + 0x5C, &animId);
+    if (cs->count > 0 && !IsBadReadPtr(cs->channels, sizeof(AnimChannel))) {
+        const AnimChannel& c0 = cs->channels[0];
+        rate = c0.rate; length = c0.length;
+        DWORD clip = (DWORD)c0.active;               // +0x10 holds the clip object
+        if (clip) SafeRead(clip, &clipVt);
+    }
+    int i = 0;
+    for (; i < g_animDiagCount; ++i)
+        if (g_animDiag[i].cs == cs && g_animDiag[i].animId == animId) break;
+    if (i == g_animDiagCount) {
+        if (g_animDiagCount == 32) { g_animDiagDropped++; return; }
+        g_animDiag[i] = { cs, animId, clipVt, rate, length, 0, 0, 0.0 };
+        g_animDiagCount++;
+    }
+    AnimDiagEntry& e = g_animDiag[i];
+    e.calls++;
+    if (steps > 1e-6) { e.advances++; e.steps += steps; }
+    e.clipVt = clipVt; e.rate = rate; e.length = length;
+}
+
+static void AnimDiagFlush(double seconds) {
+    if (!g_cfg.animDiag || !g_animDiagCount || seconds <= 0) return;
+    Logf("anim diag (%.1fs): %d character clips%s\n", seconds, g_animDiagCount,
+         g_animDiagDropped ? " (table full)" : "");
+    for (int i = 0; i < g_animDiagCount; ++i) {
+        const AnimDiagEntry& e = g_animDiag[i];
+        Logf("  set=%p anim=0x%X clipVt=0x%06lX rate=%.4f len=%.1f | calls/s=%.1f advances/s=%.1f "
+             "steps/s=%.1f\n", (const void*)e.cs, e.animId, (unsigned long)e.clipVt, e.rate, e.length,
+             e.calls / seconds, e.advances / seconds, e.steps / seconds);
+    }
+    g_animDiagCount = 0; g_animDiagDropped = 0;
+}
+
+// __fastcall: ecx = this (AnimChannelSet*), edx unused. Returns "a channel looped".
+static bool __fastcall Hook_AnimAdvance(AnimChannelSet* cs, void*) {
+    if (cs->paused) {
+        cs->elapsed = 0;
+        if (g_cfg.fixDriverShiftAnim) cs->looped = 0;
+        return false;
+    }
+    const int counter = *reinterpret_cast<volatile int*>(hp2::pStepCounter);
+
+    double steps;
+    if (g_cfg.smoothSlowMotionAnims) {
+        EnterCriticalSection(&g_animLock);
+        AnimClockEntry* e = AnimClockFor(cs);
+        double now = GameStepClock();
+        if (!e) {
+            steps = (double)(counter - cs->lastStep);
+        } else {
+            if (e->lastStep != cs->lastStep) {           // game re-synced this set (new clip/actor)
+                e->lastStep = cs->lastStep;
+                e->lastClock = cs->lastStep;
+            }
+            steps = now - e->lastClock;
+            if (steps < 0.0 || steps > 600.0) {          // clock went backwards or huge jump: resync
+                e->lastClock = now;
+                e->lastStep = counter;
+                steps = 0.0;
+            } else if (steps > 1e-6) {
+                e->lastClock = now;
+                e->lastStep = counter;
+            }
+        }
+        LeaveCriticalSection(&g_animLock);
+    } else {
+        steps = (double)(counter - cs->lastStep);
+    }
+
+    AnimDiagRecord(cs, steps);
+    if (!(steps > 1e-6)) {
+        cs->elapsed = 0;
+        if (g_cfg.fixDriverShiftAnim) cs->looped = 0;   // nothing ended during this call
+        return false;
+    }
+
+    // Integer view for the game's other users of 'elapsed' (pose refresh gate,
+    // root-motion wrap correction): at least 1 whenever time moved.
+    int whole = (int)(steps + 0.5);
+    cs->elapsed = whole < 1 ? 1 : whole;
+    cs->lastStep = counter;
+
+    bool looped = false;
+    for (int i = 0; i < cs->count; ++i) {
+        AnimChannel& ch = cs->channels[i];
+        if (!ch.active) continue;
+        ch.prevTime = ch.time;
+        ch.time = (float)((double)ch.time + steps * (double)ch.rate);
+        if (ch.time > ch.length) { ch.time = 0.0f; looped = true; }
+    }
+    cs->looped = looped ? 1 : 0;
+    return looped;
+}
+
+static void InstallAnimClockPatch() {
+    if (!g_knownExe || (!g_cfg.smoothSlowMotionAnims && !g_cfg.fixDriverShiftAnim && !g_cfg.animDiag)) return;
+    InitializeCriticalSection(&g_animLock);
+    BYTE jmp[5] = { 0xE9 };
+    DWORD rel = reinterpret_cast<DWORD>(&Hook_AnimAdvance) - (hp2::fnAnimAdvance + 5);
+    memcpy(jmp + 1, &rel, 4);
+    bool ok = PatchBytes(hp2::fnAnimAdvance, jmp, sizeof(jmp));
+    Logf("animation clock: %s (fractional=%d, shiftFix=%d)\n", ok ? "replaced" : "patch FAILED",
+         g_cfg.smoothSlowMotionAnims, g_cfg.fixDriverShiftAnim);
+}
+
+static void LogTimeScaleChanges() {
+    if (!g_knownExe) return;
+    static float last = -1.0f;
+    float ts = 0.0f;
+    if (!SafeRead(hp2::pTimeScale, &ts)) return;
+    if (ts != last) {
+        Logf("game speed: %.2fx\n", ts);
+        last = ts;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Camera diagnostics (camDiag)
+// ---------------------------------------------------------------------------
+namespace hp2 { const DWORD pViewMatrixSym = 0x846678; }   // EAGL::ViewPort::gpViewMatrix
+
+static float  g_camPrev[16];
+static bool   g_camHavePrev = false;
+static char   g_camPattern[128];
+static char   g_stepPattern[128];
+static int    g_camPatLen = 0;
+static int    g_camLastCounter = 0;
+static DWORD  g_camMatrixAddr = 0;
+
+// writer trace (camDiag=2)
+struct CamWriter { DWORD eip; DWORD chain[6]; unsigned hits; };
+static CamWriter g_camWriters[16];
+static volatile LONG g_camWriterCount = 0;
+static volatile LONG g_camWriterDropped = 0;
+static DWORD  g_mainThreadId = 0;
+static HANDLE g_mainThread = nullptr;
+static DWORD  g_watchAddr = 0;
+static PVOID  g_veh = nullptr;
+
+static bool LooksLikeReturnAddr(DWORD a) {
+    if (a < 0x401000 || a >= 0x65C000) return false;
+    const BYTE* p = reinterpret_cast<const BYTE*>(a);
+    if (IsBadReadPtr(p - 7, 7)) return false;
+    if (p[-5] == 0xE8) return true;                                  // call rel32
+    if (p[-2] == 0xFF && (p[-1] & 0x38) == 0x10) return true;         // call r/m (reg)
+    if (p[-3] == 0xFF && (p[-2] & 0x38) == 0x10) return true;         // call [r+d8]
+    if (p[-6] == 0xFF && (p[-5] & 0x38) == 0x10) return true;         // call [r+d32]/[abs]
+    return false;
+}
+
+static LONG CALLBACK CamWatchHandler(PEXCEPTION_POINTERS ep) {
+    if (ep->ExceptionRecord->ExceptionCode != EXCEPTION_SINGLE_STEP) return EXCEPTION_CONTINUE_SEARCH;
+    CONTEXT* c = ep->ContextRecord;
+    if (!(c->Dr6 & 1)) return EXCEPTION_CONTINUE_SEARCH;
+    c->Dr6 = 0;
+    DWORD eip = c->Eip;
+    DWORD chain[6] = {};
+    int n = 0;
+    const DWORD* sp = reinterpret_cast<const DWORD*>(c->Esp);
+    for (int i = 0; i < 512 && n < 6; ++i) {
+        if (IsBadReadPtr(sp + i, 4)) break;
+        if (LooksLikeReturnAddr(sp[i])) chain[n++] = sp[i];
+    }
+    LONG cnt = g_camWriterCount;
+    for (LONG i = 0; i < cnt; ++i) {
+        if (g_camWriters[i].eip == eip && g_camWriters[i].chain[0] == chain[0] &&
+            g_camWriters[i].chain[1] == chain[1]) { g_camWriters[i].hits++; return EXCEPTION_CONTINUE_EXECUTION; }
+    }
+    if (cnt < 16) {
+        g_camWriters[cnt].eip = eip;
+        memcpy(g_camWriters[cnt].chain, chain, sizeof(chain));
+        g_camWriters[cnt].hits = 1;
+        g_camWriterCount = cnt + 1;
+    } else {
+        g_camWriterDropped++;
+    }
+    return EXCEPTION_CONTINUE_EXECUTION;
+}
+
+struct ArmArgs { DWORD addr; };
+static DWORD WINAPI ArmWatchThread(LPVOID param) {
+    DWORD addr = reinterpret_cast<ArmArgs*>(param)->addr;
+    if (SuspendThread(g_mainThread) == (DWORD)-1) return 1;
+    CONTEXT c = {};
+    c.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+    BOOL ok = GetThreadContext(g_mainThread, &c);
+    if (ok) {
+        c.Dr0 = addr;
+        // L0 enable, RW0 = 01 (write), LEN0 = 11 (4 bytes)
+        c.Dr7 = (c.Dr7 & ~0x000F0003u) | 0x1u | (0x1u << 16) | (0x3u << 18);
+        ok = SetThreadContext(g_mainThread, &c);
+    }
+    ResumeThread(g_mainThread);
+    return ok ? 0 : 2;
+}
+
+static void ArmCameraWatch(DWORD addr) {
+    if (!g_veh) g_veh = AddVectoredExceptionHandler(1, CamWatchHandler);
+    if (!g_mainThread) {
+        DuplicateHandle(GetCurrentProcess(), GetCurrentThread(), GetCurrentProcess(), &g_mainThread,
+                        THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, 0);
+        g_mainThreadId = GetCurrentThreadId();
+    }
+    ArmArgs a = { addr };
+    HANDLE t = CreateThread(nullptr, 0, ArmWatchThread, &a, 0, nullptr);
+    DWORD rc = 99;
+    if (t) { WaitForSingleObject(t, 2000); GetExitCodeThread(t, &rc); CloseHandle(t); }
+    g_watchAddr = addr;
+    Logf("cam diag: write-watch on 0x%08lX %s\n", (unsigned long)addr,
+         rc == 0 ? "armed" : "FAILED (debug registers unavailable)");
+}
+
+static void CamDiagFrame() {
+    if (!g_cfg.camDiag || !g_knownExe) return;
+    DWORD sym = 0;
+    if (!SafeRead(hp2::pViewMatrixSym, &sym)) return;
+    // gpViewMatrix may be the matrix itself or a pointer to it.
+    DWORD m = (sym > 0x10000 && !IsBadReadPtr(reinterpret_cast<void*>(sym), 64)) ? sym : hp2::pViewMatrixSym;
+    if (m != g_camMatrixAddr) {
+        Logf("cam diag: view matrix at 0x%08lX (symbol value 0x%08lX)\n", (unsigned long)m, (unsigned long)sym);
+        g_camMatrixAddr = m; g_camHavePrev = false;
+        if (g_cfg.camDiag >= 2) ArmCameraWatch(m + 0x30);   // translation x
+    }
+    float cur[16];
+    if (IsBadReadPtr(reinterpret_cast<void*>(m), sizeof(cur))) return;
+    memcpy(cur, reinterpret_cast<void*>(m), sizeof(cur));
+    int counter = *reinterpret_cast<volatile int*>(hp2::pStepCounter);
+    if (g_camHavePrev && g_camPatLen < 120) {
+        g_camPattern[g_camPatLen] = memcmp(cur, g_camPrev, sizeof(cur)) ? 'C' : '.';
+        int d = counter - g_camLastCounter;
+        g_stepPattern[g_camPatLen] = (char)(d < 0 ? '-' : d > 9 ? '+' : '0' + d);
+        g_camPatLen++;
+    }
+    memcpy(g_camPrev, cur, sizeof(cur));
+    g_camHavePrev = true;
+    g_camLastCounter = counter;
+}
+
+static void CamDiagFlush() {
+    if (!g_cfg.camDiag || !g_camPatLen) return;
+    g_camPattern[g_camPatLen] = 0; g_stepPattern[g_camPatLen] = 0;
+    Logf("cam diag: camera %s\n          steps  %s\n", g_camPattern, g_stepPattern);
+    g_camPatLen = 0;
+    LONG n = g_camWriterCount;
+    for (LONG i = 0; i < n; ++i) {
+        const CamWriter& w = g_camWriters[i];
+        Logf("  writer eip=0x%06lX hits=%u chain:", (unsigned long)w.eip, w.hits);
+        for (int k = 0; k < 6 && w.chain[k]; ++k) Logf(" 0x%06lX", (unsigned long)w.chain[k]);
+        Logf("\n");
+        g_camWriters[i].hits = 0;
+    }
+}
+
 static void InstallTickPatch() {
     if (!g_knownExe || !g_cfg.preciseGameTicks) return;
     InitializeCriticalSection(&g_gridLock);
@@ -828,6 +1195,19 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
     }
 
     SampleTicksPerFrame(!loading);
+    LogTimeScaleChanges();
+    if (g_cfg.animDiag) {
+        static LONGLONG diagStart = 0;
+        if (!diagStart) diagStart = now;
+        double el = QpcToMs(now - diagStart) / 1000.0;
+        if (el >= 2.0) { AnimDiagFlush(el); diagStart = now; }
+    }
+    if (g_cfg.camDiag) {
+        CamDiagFrame();
+        static LONGLONG camStart = 0;
+        if (!camStart) camStart = now;
+        if (QpcToMs(now - camStart) >= 2000.0) { CamDiagFlush(); camStart = now; }
+    }
     g_presentCount++;
     if (g_lastPresentQpc && !loading) {
         double deltaMs = QpcToMs(now - g_lastPresentQpc);
@@ -935,6 +1315,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
         InstallLoadingPatch();
         InstallTickPatch();
         InstallSteeringPatch();
+        InstallAnimClockPatch();
 
         if (PatchIAT_Direct3DCreate8())
             Logf("D3D IAT patch OK\n");
