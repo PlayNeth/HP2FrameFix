@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.7.2
+// HP2FrameFix.asi  v0.9
 // Frame pacing, game clock fix, EAX-on-startup fix and loading speed-up
 // for Need for Speed: Hot Pursuit 2 (PC)
 //
@@ -6,6 +6,27 @@
 // (SHA-1 63147101c2ca814e964f31c06730b1292093d7f4, PE timestamp 0x3DDDE96C).
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
+//
+// Changes from v0.8:
+//  - smoothDriverSteering: the driver's steering-wheel pose (VehicleDriver,
+//    0x42E7C8) only updated every 4th 60 Hz physics step, i.e. 15 Hz, moving
+//    up to 0.1 of the range per update. It now updates every physics step
+//    with the step scaled down (0.025), so the wheel turns at the same speed
+//    but at 60 Hz. The shared 0.1 constant is left alone.
+//
+// Changes from v0.7.2:
+//  - preciseGameTicks: the game simulates on a 120 Hz tick thread driven by a
+//    chain of one-shot timeSetEvent timers (callback 0x5DBA10 -> SetEvent ->
+//    tick thread increments 0x84C38C and runs the sim handlers). Windows'
+//    multimedia timer delivers those callbacks late and unevenly, so some
+//    rendered frames get 1 or 3 sim ticks instead of 2 (visible judder at a
+//    steady 60 fps). The ASI now replaces that timer with its own
+//    high-resolution scheduler. When the limiter runs at a rate that divides
+//    the tick rate (60, 30, 120...), ticks are phase-locked to the frame
+//    schedule so every frame gets exactly the same number of ticks.
+//  - Stats now include a ticks-per-frame histogram (e.g. 2:600 = perfect).
+//  - Correction: NFSHP2.exe does import Sleep (an earlier import listing was
+//    truncated); it is not involved in the loading or timing issues.
 //
 // Changes from v0.7.1:
 //  - Removed skipRapidPresents / rapidThresholdMs. Dropping presents that came
@@ -28,8 +49,7 @@
 //    time is bounded by frame time. The render call is redirected so the screen
 //    is drawn at most every loadScreenRenderMs; the limiter is also bypassed
 //    while loading. Per-load stats are logged.
-//  - Removed the Sleep hooks: NFSHP2.exe does not import Sleep/SleepEx at all,
-//    so they never fired.
+//  - Removed the Sleep hooks (no effect on loading).
 //
 // Changes from v0.5:
 //  - timeBeginPeriod(1) always raised; hiResGameTimers answers the game's
@@ -53,7 +73,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.7.2"
+#define HP2FF_VERSION "0.9"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -72,6 +92,11 @@ namespace hp2 {
     const DWORD callLoadRender  = 0x479CCE;  // E8 call -> fnRenderScreen inside Advance
     const DWORD fnRenderScreen  = 0x598920;  // int __cdecl(Screen*)
 
+    // 120 Hz simulation ticker
+    const DWORD fnTickCallback  = 0x5DBA10;  // TIMECALLBACK, reschedules itself via timeSetEvent
+    const DWORD pTickCounter    = 0x84C38C;  // DWORD, incremented once per sim tick
+    const DWORD pTickRate       = 0x84C388;  // int, ticks per second (120)
+
     struct Sig { DWORD addr; const char* bytes; int len; };
     const Sig kSigs[] = {
         { fnRestartAudio, "\x83\x3D\xE0\x0B\x7A\x00\xFC", 7 },
@@ -79,6 +104,11 @@ namespace hp2 {
         { 0x536270,       "\x55\x8B\xEC\x8B\x45\x08\x8B\x8C\x81\x0C\x91\x01\x00", 13 }, // GetOption
         { fnProgAdvance,  "\x8B\x11\x56\x8B\x71\x04\x46\x8B", 8 },
         { callLoadRender, "\xE8\x4D\xEC\x11\x00", 5 },
+        { fnTickCallback, "\xA1\x44\xCC\x84\x00\x8B\x0D\x50\xCC\x84\x00", 11 },
+        { 0x5DBE22,       "\xA1\x8C\xC3\x84\x00\x40\xA3\x8C\xC3\x84\x00", 11 }, // tick++
+        { 0x42E7DC,       "\x83\xC2\x03", 3 },                         // steer: every 4 steps
+        { 0x42E7F9,       "\xD8\x05\x24\xD8\x65\x00", 6 },            // fadd [0.1]
+        { 0x42E810,       "\xD8\x25\x24\xD8\x65\x00", 6 },            // fsub [0.1]
     };
 }
 
@@ -91,6 +121,9 @@ struct Config {
     int   passthrough          = 0;
     int   raiseTimerResolution = 1;
     int   hiResGameTimers      = 1;
+    int   preciseGameTicks     = 1;
+    int   smoothDriverSteering = 1;
+    float tickPhase            = 0.75f; // where ticks sit inside each tick slot after a frame deadline
     int   fixEAXOnStartup      = 1;
     int   eaxFixStableFrames   = 90;    // frames the bad state must persist first
     int   speedUpLoading       = 1;
@@ -148,6 +181,11 @@ static void LoadConfig() {
                 "; --- game clock (fix for duplicated frames on Windows) ---\n"
                 "raiseTimerResolution=1\n"
                 "hiResGameTimers=1\n"
+                "; replace the game's 120 Hz sim timer with a precise, frame-locked one\n"
+                "preciseGameTicks=1\n"
+                "tickPhase=0.75\n"
+                "; update the driver's steering animation every physics step (60 Hz) instead of 15 Hz\n"
+                "smoothDriverSteering=1\n"
                 "; --- EAX: re-apply saved EAX mode after startup ---\n"
                 "fixEAXOnStartup=1\n"
                 "eaxFixStableFrames=90\n"
@@ -173,6 +211,9 @@ static void LoadConfig() {
         else if (!_stricmp(key, "passthrough"))          g_cfg.passthrough = atoi(val);
         else if (!_stricmp(key, "raiseTimerResolution")) g_cfg.raiseTimerResolution = atoi(val);
         else if (!_stricmp(key, "hiResGameTimers"))      g_cfg.hiResGameTimers = atoi(val);
+        else if (!_stricmp(key, "preciseGameTicks"))     g_cfg.preciseGameTicks = atoi(val);
+        else if (!_stricmp(key, "smoothDriverSteering")) g_cfg.smoothDriverSteering = atoi(val);
+        else if (!_stricmp(key, "tickPhase"))            g_cfg.tickPhase = (float)atof(val);
         else if (!_stricmp(key, "fixEAXOnStartup"))      g_cfg.fixEAXOnStartup = atoi(val);
         else if (!_stricmp(key, "eaxFixStableFrames"))   g_cfg.eaxFixStableFrames = atoi(val);
         else if (!_stricmp(key, "speedUpLoading"))       g_cfg.speedUpLoading = atoi(val);
@@ -214,6 +255,8 @@ static void OpenLog() {
     Logf("limiter=%d fps=%d passthrough=%d timerRes=%d hiResTimers=%d\n",
          g_cfg.enableLimiter, g_cfg.targetFPS, g_cfg.passthrough,
          g_cfg.raiseTimerResolution, g_cfg.hiResGameTimers);
+    Logf("preciseGameTicks=%d tickPhase=%.2f smoothDriverSteering=%d\n", g_cfg.preciseGameTicks,
+         g_cfg.tickPhase, g_cfg.smoothDriverSteering);
     Logf("fixEAX=%d speedUpLoading=%d loadScreenRenderMs=%d limiterDuringLoading=%d\n",
          g_cfg.fixEAXOnStartup, g_cfg.speedUpLoading, g_cfg.loadScreenRenderMs,
          g_cfg.limiterDuringLoading);
@@ -504,6 +547,210 @@ static void EAXFixTick(LONGLONG now) {
 }
 
 // ---------------------------------------------------------------------------
+// Precise game ticks: replaces the one-shot timeSetEvent chain that drives the
+// game's 120 Hz simulation thread with our own high-resolution scheduler.
+// ---------------------------------------------------------------------------
+typedef MMRESULT (WINAPI *timeSetEvent_t)(UINT, UINT, LPTIMECALLBACK, DWORD_PTR, UINT);
+typedef MMRESULT (WINAPI *timeKillEvent_t)(UINT);
+typedef void (CALLBACK *GameTimeProc_t)(UINT, UINT, DWORD_PTR, DWORD_PTR, DWORD_PTR);
+static timeSetEvent_t  g_origTimeSetEvent  = nullptr;
+static timeKillEvent_t g_origTimeKillEvent = nullptr;
+static const UINT kFakeTimerId = 0x48503254;   // never a real winmm id
+
+static bool               g_ticksActive = false;   // known exe + option on + hooks in place
+static HANDLE             g_tickWake    = nullptr;
+static HANDLE             g_tickThread  = nullptr;
+static std::atomic<bool>  g_tickArmed{false};
+static std::atomic<DWORD> g_tickUser{0};
+static std::atomic<unsigned long> g_tickFires{0}, g_tickResyncs{0};
+
+// Frame grid published by the limiter (one writer: render thread).
+static CRITICAL_SECTION g_gridLock;
+static bool     g_gridLockInit = false;
+static LONGLONG g_gridAnchor = 0;    // any frame deadline (QPC)
+static LONGLONG g_gridPeriod = 0;    // frame period (QPC), 0 = no grid
+static int      g_gridTpf    = 0;    // ticks per frame, 0 = not an integer
+static LONG     g_gridGen    = 0;
+
+static int GameTickRate() {
+    int r = 0;
+    if (!SafeRead(hp2::pTickRate, &r) || r <= 0 || r > 10000) r = 120;
+    return r;
+}
+
+static void PublishGrid(LONGLONG anchor, LONGLONG period) {
+    if (!g_ticksActive || !g_gridLockInit) return;
+    int rate = GameTickRate();
+    int fps  = g_cfg.targetFPS;
+    EnterCriticalSection(&g_gridLock);
+    g_gridAnchor = anchor;
+    g_gridPeriod = period;
+    g_gridTpf    = (period > 0 && fps > 0 && rate % fps == 0) ? rate / fps : 0;
+    g_gridGen++;
+    LeaveCriticalSection(&g_gridLock);
+}
+
+static void WaitUntilOn(HANDLE timer, LONGLONG deadline) {
+    LONGLONG now = QpcNow();
+    double remainingMs = QpcToMs(deadline - now);
+    if (timer) {
+        if (remainingMs > 0.6) {
+            LARGE_INTEGER due;
+            due.QuadPart = -(LONGLONG)((remainingMs - 0.3) * 10000.0);
+            if (SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
+                WaitForSingleObject(timer, INFINITE);
+        }
+    } else if (remainingMs > 2.0) {
+        ::Sleep((DWORD)(remainingMs - 1.5));
+    }
+    do { YieldProcessor(); now = QpcNow(); } while (now < deadline);
+}
+
+static DWORD WINAPI TickSchedulerThread(LPVOID) {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    typedef HANDLE (WINAPI *CWTEx_t)(LPSECURITY_ATTRIBUTES, LPCWSTR, DWORD, DWORD);
+    auto pCreate = reinterpret_cast<CWTEx_t>((void*)
+        GetProcAddress(GetModuleHandleA("kernel32.dll"), "CreateWaitableTimerExW"));
+    HANDLE timer = pCreate ? pCreate(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                     TIMER_ALL_ACCESS) : nullptr;
+    const LONGLONG freq = g_qpcFreq.QuadPart;
+
+    LONG     gen = -1;
+    LONGLONG base = 0, num = 1, den = 1, k = 0, lastFire = 0;
+
+    for (;;) {
+        if (!g_tickArmed.load()) { WaitForSingleObject(g_tickWake, 100); continue; }
+
+        int rate = GameTickRate();
+        LONGLONG tickLen = freq / rate;
+        LONGLONG now = QpcNow();
+
+        LONG curGen; LONGLONG ga, gp; int tpf;
+        EnterCriticalSection(&g_gridLock);
+        curGen = g_gridGen; ga = g_gridAnchor; gp = g_gridPeriod; tpf = g_gridTpf;
+        LeaveCriticalSection(&g_gridLock);
+
+        if (curGen != gen || base == 0) {
+            gen = curGen;
+            // Never fire two ticks closer than half a tick apart.
+            LONGLONG earliest = lastFire ? lastFire + tickLen / 2 : now;
+            if (earliest < now - tickLen) earliest = now - tickLen;
+            if (gp > 0 && tpf > 0) {
+                // Phase-lock: tpf ticks per frame, offset into each tick slot.
+                num = gp; den = tpf;
+                base = ga + (LONGLONG)((double)g_cfg.tickPhase * (double)gp / tpf);
+                while (base > earliest) base -= gp;
+            } else {
+                num = freq; den = rate;
+                base = earliest;
+            }
+            LONGLONG diff = earliest - base;            // >= 0
+            k = (diff * den + num - 1) / num;           // first slot at or after 'earliest'
+        }
+
+        LONGLONG t = base + (k * num) / den;
+        if (now - t > 8 * tickLen) {                    // stalled (alt-tab, hitch): resync
+            base = now; num = freq; den = rate; k = 0; t = now;
+            gen = -1;                                    // re-lock on next pass
+            g_tickResyncs++;
+        }
+        WaitUntilOn(timer, t);
+
+        if (!g_tickArmed.exchange(false)) continue;    // killed while waiting
+        lastFire = t;
+        k++;
+        g_tickFires++;
+        reinterpret_cast<GameTimeProc_t>(hp2::fnTickCallback)(
+            kFakeTimerId, 0, g_tickUser.load(), 0, 0);   // re-arms via Hook_timeSetEvent
+    }
+    return 0;
+}
+
+static MMRESULT WINAPI Hook_timeSetEvent(UINT delay, UINT res, LPTIMECALLBACK cb,
+                                         DWORD_PTR user, UINT flags) {
+    if (g_ticksActive && reinterpret_cast<DWORD>(cb) == hp2::fnTickCallback &&
+        !(flags & TIME_PERIODIC)) {
+        if (!g_tickThread) {
+            g_tickThread = CreateThread(nullptr, 0, TickSchedulerThread, nullptr, 0, nullptr);
+            Logf("game ticks: precise scheduler started (rate=%d Hz)\n", GameTickRate());
+        }
+        g_tickUser = (DWORD)user;
+        g_tickArmed = true;
+        SetEvent(g_tickWake);
+        return kFakeTimerId;
+    }
+    return g_origTimeSetEvent ? g_origTimeSetEvent(delay, res, cb, user, flags)
+                              : ::timeSetEvent(delay, res, cb, user, flags);
+}
+
+static MMRESULT WINAPI Hook_timeKillEvent(UINT id) {
+    if (id == kFakeTimerId) { g_tickArmed = false; return TIMERR_NOERROR; }
+    return g_origTimeKillEvent ? g_origTimeKillEvent(id) : ::timeKillEvent(id);
+}
+
+// ---------------------------------------------------------------------------
+// Driver steering animation: 15 Hz -> 60 Hz
+// ---------------------------------------------------------------------------
+static float g_driverSteerStep = 0.025f;   // original 0.1 per 4 physics steps
+
+static bool PatchBytes(DWORD at, const void* bytes, size_t len) {
+    void* p = reinterpret_cast<void*>(at);
+    DWORD oldProt;
+    if (!VirtualProtect(p, len, PAGE_EXECUTE_READWRITE, &oldProt)) return false;
+    memcpy(p, bytes, len);
+    DWORD dummy;
+    VirtualProtect(p, len, oldProt, &dummy);
+    FlushInstructionCache(GetCurrentProcess(), p, len);
+    return true;
+}
+
+static void InstallSteeringPatch() {
+    if (!g_knownExe || !g_cfg.smoothDriverSteering) return;
+    const BYTE every = 0x00;                       // add edx, 0 -> update when step counter advances
+    DWORD stepAddr = reinterpret_cast<DWORD>(&g_driverSteerStep);
+    bool ok = PatchBytes(0x42E7DE, &every, 1) &&
+              PatchBytes(0x42E7FB, &stepAddr, 4) &&   // fadd dword ptr [g_driverSteerStep]
+              PatchBytes(0x42E812, &stepAddr, 4);     // fsub dword ptr [g_driverSteerStep]
+    Logf("driver steering: %s\n", ok ? "updates every physics step (60 Hz)" : "patch FAILED");
+}
+
+static void InstallTickPatch() {
+    if (!g_knownExe || !g_cfg.preciseGameTicks) return;
+    InitializeCriticalSection(&g_gridLock);
+    g_gridLockInit = true;
+    g_tickWake = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    bool set = false, kill = false;
+    ForEachImport("winmm.dll", [&](void** slot, const char* name) {
+        void* old = nullptr;
+        if (!strcmp(name, "timeSetEvent") && PatchPointer(slot, (void*)&Hook_timeSetEvent, &old)) {
+            g_origTimeSetEvent = reinterpret_cast<timeSetEvent_t>(old); set = true;
+        } else if (!strcmp(name, "timeKillEvent") && PatchPointer(slot, (void*)&Hook_timeKillEvent, &old)) {
+            g_origTimeKillEvent = reinterpret_cast<timeKillEvent_t>(old); kill = true;
+        }
+    });
+    g_ticksActive = set && kill && g_tickWake;
+    Logf("game ticks: %s\n", g_ticksActive ? "timeSetEvent/timeKillEvent hooked"
+                                           : "hook FAILED, using the game's own timer");
+}
+
+// Ticks-per-frame histogram, read at each Present.
+static DWORD g_lastTickCount = 0;
+static bool  g_haveTickCount = false;
+static unsigned long g_tpfHist[5] = {};
+
+static void SampleTicksPerFrame(bool countIt) {
+    if (!g_knownExe) return;
+    DWORD c = 0;
+    if (!SafeRead(hp2::pTickCounter, &c)) return;
+    if (g_haveTickCount && countIt) {
+        DWORD d = c - g_lastTickCount;
+        g_tpfHist[d > 4 ? 4 : d]++;
+    }
+    g_lastTickCount = c;
+    g_haveTickCount = true;
+}
+
+// ---------------------------------------------------------------------------
 // Present hook
 // ---------------------------------------------------------------------------
 static std::atomic<bool> g_firstPresentSeen{false};
@@ -521,7 +768,12 @@ static void LogStats() {
              g_presentCount, g_intervalCount, g_minDelta, avg,
              avg > 0.0 ? 1000.0 / avg : 0.0, g_maxDelta,
              g_gtcCalls.exchange(0), g_tgtCalls.exchange(0));
+        if (g_knownExe)
+            Logf("  sim ticks per frame: 0:%lu 1:%lu 2:%lu 3:%lu 4+:%lu | scheduler fires=%lu resyncs=%lu\n",
+                 g_tpfHist[0], g_tpfHist[1], g_tpfHist[2], g_tpfHist[3], g_tpfHist[4],
+                 g_tickFires.exchange(0), g_tickResyncs.exchange(0));
     }
+    memset(g_tpfHist, 0, sizeof(g_tpfHist));
     g_minDelta = 1e9; g_maxDelta = 0.0; g_sumDelta = 0.0; g_intervalCount = 0;
 }
 
@@ -563,15 +815,19 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
                 WaitUntil(g_nextDeadline);
                 now = QpcNow();
             }
-            if (!g_nextDeadline || now - g_nextDeadline > period)
+            if (!g_nextDeadline || now - g_nextDeadline > period) {
                 g_nextDeadline = now + period;
-            else
+                PublishGrid(g_nextDeadline, period);   // new frame schedule: re-lock ticks
+            } else {
                 g_nextDeadline += period;
+            }
         } else {
+            if (g_nextDeadline) PublishGrid(0, 0);   // limiter paused: free-running ticks
             g_nextDeadline = 0;   // resync cleanly when limiting resumes
         }
     }
 
+    SampleTicksPerFrame(!loading);
     g_presentCount++;
     if (g_lastPresentQpc && !loading) {
         double deltaMs = QpcToMs(now - g_lastPresentQpc);
@@ -677,6 +933,8 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
         }
         PatchIAT_Timers();
         InstallLoadingPatch();
+        InstallTickPatch();
+        InstallSteeringPatch();
 
         if (PatchIAT_Direct3DCreate8())
             Logf("D3D IAT patch OK\n");
