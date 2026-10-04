@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.17.9
+// HP2FrameFix.asi  v0.17.10
 // Widescreen section: based on HP2WSFix (MIT, Lovro Pleše) - see that section.
 // HD car reflections section: GPL-3.0 (derived from NFSHP2 HD Reflections by
 // Arctic94 / NFS HD Reflections by Aero_) - see the "HD car reflections" section.
@@ -10,6 +10,8 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.17.10: the EA Trax chyron in races (child of the race GUI root,
+//    SimGUIInterface) goes to the left edge with the rest of the HUD.
 // v0.17.9: Hor+ only for views that ask for exactly the whole screen (race
 //    view). Views cropped by the screen (showroom car) already keep their
 //    shape via the game's own crop factors - correcting them squished the car.
@@ -204,7 +206,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.17.9"
+#define HP2FF_VERSION "0.17.10"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -2414,6 +2416,7 @@ static DWORD __fastcall Ws_ReadBounds(void* reader, void*, const char* key, void
     e->w = w; e->vt = *reinterpret_cast<DWORD*>(w); e->flags = 0;
     strncpy(e->name, name, sizeof(e->name) - 1); e->name[sizeof(e->name) - 1] = 0;
     const char* cls = strrchr(name, '.'); cls = cls ? cls + 1 : name;
+    if (!strcmp(cls, "SimGUIInterface")) e->flags |= kWsHudView;   // race GUI root: EA Trax chyron
     if (!strcmp(cls, "HudView")) {
         e->flags |= kWsHudView;
         // its parent (<HUD>.GWidget) holds more HUD parts: the minimap, the mirror
