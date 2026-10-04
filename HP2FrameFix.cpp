@@ -1,4 +1,6 @@
-// HP2FrameFix.asi  v0.15.6
+// HP2FrameFix.asi  v0.16
+// HD car reflections section: GPL-3.0 (derived from NFSHP2 HD Reflections by
+// Arctic94 / NFS HD Reflections by Aero_) - see the "HD car reflections" section.
 // Frame pacing, game clock fix, EAX-on-startup fix and loading speed-up
 // for Need for Speed: Hot Pursuit 2 (PC)
 //
@@ -7,6 +9,8 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.16: HD car reflections built in (hdReflections and refl* keys), including
+//    the fix for the cubemap's alternating halves (seam flicker).
 // v0.15.6: the car reflection probe (cubemap update, 0x4D7985) gets the car's
 //    blended position too; it used the raw 60 Hz physics position, so the
 //    reflections stepped against the smoothly drawn car.
@@ -167,7 +171,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.15.6"
+#define HP2FF_VERSION "0.16"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -276,6 +280,15 @@ struct Config {
     int   logToFile            = 1;
     int   logEveryNFrames      = 600;
     // interpolation (v0.15)
+    // HD car reflections (v0.16, from NFSHP2 HD Reflections by Arctic94 / Aero_, GPL-3)
+    int   hdReflections        = 1;
+    int   reflAutoRes          = 1;     // 1080p 512, 1440p 1024, 2160p 2048
+    int   reflCubemapRes       = 512;
+    int   reflEnviromapRes     = 512;
+    int   reflPowerOfTwo       = 0;
+    float reflBrightness       = 1.0f;
+    int   reflFullDetail       = 1;     // all 6 faces even on lower in-game reflection detail
+    int   reflAllFacesEveryFrame = 1;   // no alternating halves (seam flicker)
     int   interpolate          = 1;     // blend cars between 60 Hz physics steps
     int   interpolateCamera    = 1;     // blend the camera too
     float interpDelay          = 1.0f;  // steps behind the newest step that frames are drawn
@@ -321,6 +334,24 @@ static const char kInterpBlock[] =
     "; don't blend jumps bigger than this per step (resets, teleports, camera cuts)\n"
     "maxStepDistance=10\n"
     "maxStepAngle=90\n";
+
+static const char kReflBlock[] =
+    "; --- HD car reflections (from NFSHP2 HD Reflections by Arctic94 / Aero_) ---\n"
+    "; sharper car reflections: the reflection cubemap and environment map are 128x128 in the game\n"
+    "hdReflections=1\n"
+    "; pick the resolution from the display height (1080p = 512, 1440p = 1024, 2160p = 2048)\n"
+    "reflAutoRes=1\n"
+    "; used when reflAutoRes=0 (128 = game default, 256, 512, 1024, 2048)\n"
+    "reflCubemapRes=512\n"
+    "reflEnviromapRes=512\n"
+    "; round the resolutions down to a power of two (old GPUs)\n"
+    "reflPowerOfTwo=0\n"
+    "; reflection intensity 0.0 - 1.0 (1.0 = game default)\n"
+    "reflBrightness=1.0\n"
+    "; render the full dynamic reflection even when the in-game reflection detail is lower\n"
+    "reflFullDetail=1\n"
+    "; render all 6 cubemap faces every frame (the game alternates halves -> seam flicker at HD)\n"
+    "reflAllFacesEveryFrame=1\n";
 
 static void LoadConfig() {
     if (g_cfgLoaded) return;
@@ -371,12 +402,13 @@ static void LoadConfig() {
                 "logToFile=1\n"
                 "logEveryNFrames=600\n", f);
             fputs(kInterpBlock, f);
+            fputs(kReflBlock, f);
             fclose(f);
         }
         return;
     }
     char line[256];
-    bool sawInterp = false;
+    bool sawInterp = false, sawRefl = false;
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == ';' || line[0] == '#' || line[0] == '\r' || line[0] == '\n') continue;
         char key[64] = {}, val[64] = {};
@@ -402,6 +434,14 @@ static void LoadConfig() {
         else if (!_stricmp(key, "limiterDuringLoading")) g_cfg.limiterDuringLoading = atoi(val);
         else if (!_stricmp(key, "logToFile"))            g_cfg.logToFile = atoi(val);
         else if (!_stricmp(key, "logEveryNFrames"))      g_cfg.logEveryNFrames = atoi(val);
+        else if (!_stricmp(key, "hdReflections"))        { g_cfg.hdReflections = atoi(val); sawRefl = true; }
+        else if (!_stricmp(key, "reflAutoRes"))          g_cfg.reflAutoRes = atoi(val);
+        else if (!_stricmp(key, "reflCubemapRes"))       g_cfg.reflCubemapRes = atoi(val);
+        else if (!_stricmp(key, "reflEnviromapRes"))     g_cfg.reflEnviromapRes = atoi(val);
+        else if (!_stricmp(key, "reflPowerOfTwo"))       g_cfg.reflPowerOfTwo = atoi(val);
+        else if (!_stricmp(key, "reflBrightness"))       g_cfg.reflBrightness = (float)atof(val);
+        else if (!_stricmp(key, "reflFullDetail"))       g_cfg.reflFullDetail = atoi(val);
+        else if (!_stricmp(key, "reflAllFacesEveryFrame")) g_cfg.reflAllFacesEveryFrame = atoi(val);
         else if (!_stricmp(key, "interpolate"))          { g_cfg.interpolate = atoi(val); sawInterp = true; }
         else if (!_stricmp(key, "interpolateCamera"))    g_cfg.interpolateCamera = atoi(val);
         else if (!_stricmp(key, "interpDelay"))          g_cfg.interpDelay = (float)atof(val);
@@ -412,6 +452,10 @@ static void LoadConfig() {
     if (!sawInterp) {                     // ini from an older version: add the new keys
         FILE* a = fopen(path, "a");
         if (a) { fputs("\n", a); fputs(kInterpBlock, a); fclose(a); }
+    }
+    if (!sawRefl) {
+        FILE* a = fopen(path, "a");
+        if (a) { fputs("\n", a); fputs(kReflBlock, a); fclose(a); }
     }
 }
 
@@ -1920,6 +1964,97 @@ static bool PatchIAT_Direct3DCreate8() {
 }
 
 // ---------------------------------------------------------------------------
+// HD car reflections (v0.16)
+//
+// Patches from NFSHP2 HD Reflections by Arctic94 (fork of NFS HD Reflections by
+// Aero_), https://github.com/Arctic94/NFSHDReflections, GPL-3.0 - so this file,
+// as a derived work, is GPL-3.0 too. Changes over that mod:
+//  - reflAllFacesEveryFrame: the cubemap update (0x53E7E0) renders face 2 on
+//    odd calls and the other five on even ones ([mgr+0x254] parity) but
+//    composites all six every frame, mixing two car positions - the seams
+//    flicker at HD resolutions. All six now render every frame.
+//  - every patched byte is checked first; if another reflections mod already
+//    changed them, this section stays off.
+// The probe position itself is blended by the interpolation (Hook_ReflUpdate).
+// ---------------------------------------------------------------------------
+namespace hp2 {
+    struct ReflSig { DWORD addr; const char* bytes; size_t len; };
+    const ReflSig kReflSigs[] = {
+        { 0x53E143, "\x68\x80\x00\x00\x00\x68\x80\x00\x00\x00", 10 },  // composite target 128x128
+        { 0x53E175, "\x68\x80\x00\x00\x00\x68\x80\x00\x00\x00", 10 },  // cube faces 128x128
+        { 0x53E12A, "\x8B\x0D\x74\x54\x66\x00", 6 },                  // composite viewport [0x665474]
+        { 0x53E169, "\xA1\x74\x54\x66\x00", 5 },                      // cube viewport [0x665474]
+        { 0x665474, "\x00\x00\x00\x43", 4 },                          // 128.0f
+        { 0x53EB4E, "\x68\x00\x00\x00\x3F\x68\x00\x00\x00\x3F", 10 },  // composite view scale 0.5
+        { 0x53ED46, "\x68\x00\x00\x00\x3F\x68\x00\x00\x00\x3F", 10 },
+        { 0x53E06D, "\x06\x00\x00\x00\xC7\x03\xFF\x00\x00\x00\xC7\x07\xFF\x00\x00\x00"
+                    "\xC7\x46\x08\xFF\x00\x00\x00", 23 },               // reflection colour 255
+        { 0x53E85F, "\x0F\x84\x88\x00\x00\x00", 6 },                  // face parity branch
+        { 0x53E8E8, "\xE9\x45\x02\x00\x00", 5 },                      // jmp last face + composite
+        { 0x53E8F6, "\x83\xB8\x78\x3D\x01\x00\x02\x0F\x85\x36\x02\x00\x00", 13 }, // detail == 2
+        { 0x53EB32, "\x8B\xCE\xE8\xB7\x00\x00\x00", 7 },              // render face
+    };
+}
+extern "C" void ReflFaceTwoThenRest();
+extern "C" { DWORD g_reflFnRenderFace = 0x53EBF0, g_reflContRest = 0x53E8ED; }
+__asm__(
+    ".globl _ReflFaceTwoThenRest\n"
+    "_ReflFaceTwoThenRest:\n"           // from jmp at 0x53E8E8; (view, 2) pushed, esi = manager
+    "    movl %esi, %ecx\n"
+    "    call *_g_reflFnRenderFace\n"    // render face 2 (thiscall, ret 8)
+    "    jmp *_g_reflContRest\n");      // then the other five, then the composite
+
+static float g_reflCubeRes = 128.f, g_reflEnvRes = 128.f, g_reflEnvScale = 0.5f;
+
+static void InstallReflections() {
+    if (!g_knownExe || !g_cfg.hdReflections) { Logf("HD reflections: off\n"); return; }
+    for (const auto& sg : hp2::kReflSigs)
+        if (IsBadReadPtr(reinterpret_cast<void*>(sg.addr), sg.len) ||
+            memcmp(reinterpret_cast<void*>(sg.addr), sg.bytes, sg.len) != 0) {
+            Logf("HD reflections: code at 0x%06lX already changed (NFSHP2HDReflections.asi or similar "
+                 "loaded?) - left to that mod\n", (unsigned long)sg.addr);
+            return;
+        }
+    int cube = g_cfg.reflCubemapRes, env = g_cfg.reflEnviromapRes;
+    if (g_cfg.reflAutoRes) {
+        int y = GetSystemMetrics(SM_CYSCREEN);
+        cube = y >= 2160 ? 2048 : y >= 1440 ? 1024 : y >= 1080 ? 512 : 256;
+        env = cube;
+    }
+    if (g_cfg.reflPowerOfTwo) {
+        auto pot = [](int x) { if (x <= 0) return 128; int p = 1; while ((p << 1) <= x) p <<= 1; return p; };
+        cube = pot(cube); env = pot(env);
+    }
+    if (cube < 32) cube = 32; if (cube > 4096) cube = 4096;
+    if (env < 32) env = 32;   if (env > 4096) env = 4096;
+    g_reflCubeRes = (float)cube; g_reflEnvRes = (float)env; g_reflEnvScale = (float)env / 256.0f;
+
+    DWORD v; bool ok = true;
+    v = env;  ok &= PatchBytes(0x53E144, &v, 4) && PatchBytes(0x53E149, &v, 4);
+    v = cube; ok &= PatchBytes(0x53E176, &v, 4) && PatchBytes(0x53E17B, &v, 4);
+    float* pe = &g_reflEnvRes; float* pc = &g_reflCubeRes;
+    ok &= PatchBytes(0x53E12C, &pe, 4) && PatchBytes(0x53E16A, &pc, 4) && PatchBytes(0x665474, &g_reflCubeRes, 4);
+    ok &= PatchBytes(0x53EB4F, &g_reflEnvScale, 4) && PatchBytes(0x53EB54, &g_reflEnvScale, 4) &&
+          PatchBytes(0x53ED47, &g_reflEnvScale, 4) && PatchBytes(0x53ED4C, &g_reflEnvScale, 4);
+    if (g_cfg.reflBrightness != 1.0f) {
+        float b = 255.0f * g_cfg.reflBrightness;
+        v = b < 0 ? 0 : b > 255.0f ? 255 : (DWORD)b;
+        ok &= PatchBytes(0x53E073, &v, 4) && PatchBytes(0x53E079, &v, 4) && PatchBytes(0x53E080, &v, 4);
+    }
+    const BYTE nop6[6] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+    if (g_cfg.reflFullDetail) ok &= PatchBytes(0x53E8FD, nop6, 6);
+    if (g_cfg.reflAllFacesEveryFrame) {
+        BYTE jmp[5] = { 0xE9 };
+        DWORD rel = reinterpret_cast<DWORD>(&ReflFaceTwoThenRest) - (0x53E8E8 + 5);
+        memcpy(jmp + 1, &rel, 4);
+        ok &= PatchBytes(0x53E85F, nop6, 6) && PatchBytes(0x53E8E8, jmp, 5);
+    }
+    Logf("HD reflections: %s (cubemap %d, environment map %d, brightness %.2f, full detail %d, "
+         "all faces every frame %d)\n", ok ? "on" : "patch FAILED", cube, env, g_cfg.reflBrightness,
+         g_cfg.reflFullDetail, g_cfg.reflAllFacesEveryFrame);
+}
+
+// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
@@ -1946,6 +2081,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
         InstallParticlesPatch();
         InstallCharacterAnimPatch();
         InstallInterpolation();
+        InstallReflections();
 
         if (PatchIAT_Direct3DCreate8())
             Logf("D3D IAT patch OK\n");
