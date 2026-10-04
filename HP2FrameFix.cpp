@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.13.1
+// HP2FrameFix.asi  v0.15-interp (test build)
 // Frame pacing, game clock fix, EAX-on-startup fix and loading speed-up
 // for Need for Speed: Hot Pursuit 2 (PC)
 //
@@ -6,6 +6,20 @@
 // (SHA-1 63147101c2ca814e964f31c06730b1292093d7f4, PE timestamp 0x3DDDE96C).
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
+//
+// v0.15-interp (TEST BUILD, based on v0.13.2):
+//  - Interpolation: racing cars and the camera are drawn between the game's
+//    60 Hz physics steps, so motion is smooth at any frame rate above 60.
+//    After every WorldStep (0x4D0370) the physics bodies of the cars drawn last
+//    frame (vehicle+0x6E8: pos +0x2A8, 3x3 +0x2B4) and each view's active camera
+//    (eye/target/fov/up) are snapshot. At render time CarModel::SetTransform
+//    (0x42B940, called from 0x4CA860 with the body's pose) and BuildView
+//    (0x40D620) get values blended between the snapshots around "display time
+//    minus interpDelay steps"; the camera is restored right after the view is
+//    built. Cars/cameras that don't match the newest snapshot (replays, resets,
+//    cameras changed outside a step) are drawn exactly as the game had them.
+//    The log counts car draws through two other paths (list B, sim-placed
+//    cars) that are not blended yet.
 //
 // Changes from v0.13.1:
 //  - Fixed the game speeding up when the frame cap can't be reached (e.g. a
@@ -122,6 +136,7 @@
 #include <mmsystem.h>
 #include <d3d8.h>
 #include <atomic>
+#include <cmath>
 #include <cstdarg>
 #include <cstddef>
 #include <cstdio>
@@ -132,7 +147,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.13.2"
+#define HP2FF_VERSION "0.15-interp"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -186,6 +201,20 @@ namespace hp2 {
         { 0x4444DE,       "\xD8\x0D\x90\xD6\x65\x00", 6 },
         { 0x4444F9,       "\xD8\x0D\x90\xD6\x65\x00", 6 },
         { 0x444517,       "\xD8\x0D\x90\xD6\x65\x00", 6 },
+        // interpolation (v0.15)
+        { 0x4D0370,       "\xE8\x2B\xFD\xFF\xFF", 5 },                 // call WorldStep
+        { 0x4CA968,       "\xE8\x13\x0F\xF6\xFF", 5 },                 // call CarModel::SetOwner
+        { 0x4CA978,       "\xE8\xC3\x0F\xF6\xFF", 5 },                 // call CarModel::SetTransform
+        { 0x4CA8D7,       "\x8B\x88\x70\x01\x00\x00", 6 },            // vehicle = [x+0x170]
+        { 0x4CA8E3,       "\x8B\x90\xA8\x02\x00\x00", 6 },            // body pos at +0x2A8
+        { 0x4CA960,       "\x8B\xB1\x2C\x0D\x00\x00", 6 },            // CarModel = [veh+0xD2C]
+        { 0x4D7734,       "\xE8\xE7\x5E\xF3\xFF", 5 },                 // call BuildView (main)
+        { 0x4D7813,       "\xE8\x08\x5E\xF3\xFF", 5 },                 // call BuildView (2nd)
+        { 0x40D626,       "\x8B\x81\x64\x01\x00\x00", 6 },            // active camera slot
+        { 0x40C269,       "\x39\x7B\x68", 3 },                           // camera id at +0x68
+        { 0x40C756,       "\x8D\x41\x04", 3 },                           // eye at cam+8
+        { 0x4CAA7F,       "\xE8\x8C\x15\xF6\xFF", 5 },                 // car draw, list B
+        { 0x44D6D0,       "\xE8\x3B\xE9\xFD\xFF", 5 },                 // car draw, sim-placed cars
     };
 }
 
@@ -214,6 +243,12 @@ struct Config {
     int   limiterDuringLoading = 0;
     int   logToFile            = 1;
     int   logEveryNFrames      = 600;
+    // interpolation (v0.15)
+    int   interpolate          = 1;     // blend cars between 60 Hz physics steps
+    int   interpolateCamera    = 1;     // blend the camera too
+    float interpDelay          = 1.0f;  // steps behind the newest step that frames are drawn
+    float maxStepDistance      = 10.0f; // don't blend a jump bigger than this per step (resets, cuts)
+    float maxStepAngle         = 90.0f;
 };
 
 static Config g_cfg;
@@ -243,6 +278,17 @@ static void InitGameDir() {
     char* slash = strrchr(g_gameDir, '\\');
     if (slash) *(slash + 1) = 0; else g_gameDir[0] = 0;
 }
+
+static const char kInterpBlock[] =
+    "; --- interpolation: draw cars and camera between the game's 60 Hz physics steps,\n"
+    ";     so motion is smooth at any frame rate above 60 ---\n"
+    "interpolate=1\n"
+    "interpolateCamera=1\n"
+    "; how many 1/60 s steps behind the newest step frames are drawn (1.0 = least delay)\n"
+    "interpDelay=1.0\n"
+    "; don't blend jumps bigger than this per step (resets, teleports, camera cuts)\n"
+    "maxStepDistance=10\n"
+    "maxStepAngle=90\n";
 
 static void LoadConfig() {
     if (g_cfgLoaded) return;
@@ -292,11 +338,13 @@ static void LoadConfig() {
                 "; --- logging ---\n"
                 "logToFile=1\n"
                 "logEveryNFrames=600\n", f);
+            fputs(kInterpBlock, f);
             fclose(f);
         }
         return;
     }
     char line[256];
+    bool sawInterp = false;
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == ';' || line[0] == '#' || line[0] == '\r' || line[0] == '\n') continue;
         char key[64] = {}, val[64] = {};
@@ -322,8 +370,17 @@ static void LoadConfig() {
         else if (!_stricmp(key, "limiterDuringLoading")) g_cfg.limiterDuringLoading = atoi(val);
         else if (!_stricmp(key, "logToFile"))            g_cfg.logToFile = atoi(val);
         else if (!_stricmp(key, "logEveryNFrames"))      g_cfg.logEveryNFrames = atoi(val);
+        else if (!_stricmp(key, "interpolate"))          { g_cfg.interpolate = atoi(val); sawInterp = true; }
+        else if (!_stricmp(key, "interpolateCamera"))    g_cfg.interpolateCamera = atoi(val);
+        else if (!_stricmp(key, "interpDelay"))          g_cfg.interpDelay = (float)atof(val);
+        else if (!_stricmp(key, "maxStepDistance"))      g_cfg.maxStepDistance = (float)atof(val);
+        else if (!_stricmp(key, "maxStepAngle"))         g_cfg.maxStepAngle = (float)atof(val);
     }
     fclose(f);
+    if (!sawInterp) {                     // ini from an older version: add the new keys
+        FILE* a = fopen(path, "a");
+        if (a) { fputs("\n", a); fputs(kInterpBlock, a); fclose(a); }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -363,6 +420,9 @@ static void OpenLog() {
     Logf("fixEAX=%d speedUpLoading=%d loadScreenRenderMs=%d limiterDuringLoading=%d\n",
          g_cfg.fixEAXOnStartup, g_cfg.speedUpLoading, g_cfg.loadScreenRenderMs,
          g_cfg.limiterDuringLoading);
+    Logf("interpolate=%d interpolateCamera=%d interpDelay=%.2f maxStepDistance=%.1f maxStepAngle=%.0f\n",
+         g_cfg.interpolate, g_cfg.interpolateCamera, g_cfg.interpDelay, g_cfg.maxStepDistance,
+         g_cfg.maxStepAngle);
 }
 
 // ---------------------------------------------------------------------------
@@ -1128,6 +1188,415 @@ static bool     g_gridUnstable   = false;
 static unsigned long long g_presentCount = 0, g_intervalCount = 0;
 static double g_minDelta = 1e9, g_maxDelta = 0.0, g_sumDelta = 0.0;
 
+// ---------------------------------------------------------------------------
+// Interpolation (v0.15)
+//
+// The world steps at 60 Hz (WorldStep 0x4D00A0, called from 0x4D0370) and the
+// game draws whatever the last step left. Racing cars are re-posed at render
+// time from their physics bodies (0x4CA860 -> CarModel::SetTransform 0x42B940
+// with body pos +0x2A8 / 3x3 rotation +0x2B4, z flipped), and the view is built
+// from the active camera object of each player view (0x40D620: eye +8,
+// target +0x14, fov +0x20, up +0x40). The camera director reads the physics
+// bodies, not the car models, so blended car models never feed back into the
+// simulation.
+//
+// After every step we snapshot the bodies and cameras (time-stamped with the
+// frame's display time); at render time each car's SetTransform and each view
+// build get values blended between the two snapshots around "display time
+// minus interpDelay steps". Anything that doesn't match the newest snapshot
+// (replays, resets, cameras moved outside a step) is drawn as the game had it.
+// ---------------------------------------------------------------------------
+namespace hp2 {
+    const DWORD callWorldStep   = 0x4D0370;  const DWORD fnWorldStep   = 0x4D00A0;  // cdecl(step)
+    const DWORD callCarSetOwner = 0x4CA968;  const DWORD fnCarSetOwner = 0x42B880;  // this=CarModel (veh)
+    const DWORD callCarSetXform = 0x4CA978;  const DWORD fnCarSetXform = 0x42B940;  // this=CarModel (view,pos*,rot*)
+    const DWORD callBuildView1  = 0x4D7734;  const DWORD callBuildView2 = 0x4D7813;
+    const DWORD fnBuildView     = 0x40D620;  // this=view owner (a,b,c), ret 0xC
+    const DWORD callDrawListB   = 0x4CAA7F;  const DWORD callDrawSimCar = 0x44D6D0;
+    const DWORD fnCarDraw       = 0x42C010;  // this=CarModel (view), ret 4
+    const DWORD pReplayFlag     = 0x7221EC;  // BYTE, world steps skipped while set
+}
+typedef void  (__cdecl    *WorldStep_t)(int step);
+typedef void  (__fastcall *CarSetOwner_t)(void* car, void* edx, void* veh);
+typedef void  (__fastcall *CarSetXform_t)(void* car, void* edx, void* view, const float* pos, const float* rot);
+typedef DWORD (__fastcall *BuildView_t)(void* owner, void* edx, DWORD a, DWORD b, DWORD c);
+typedef void  (__fastcall *CarDraw_t)(void* car, void* edx, void* view);
+
+static const int kIpCars = 32, kIpCams = 4, kIpRing = 4;
+struct IpCar { DWORD veh; float x[12]; };                 // body pos (3) + rotation (9), physics space
+struct IpCam { DWORD owner, cam, activeId; float f[10]; }; // eye 3, target 3, fov, up 3
+struct IpSnap { int idx; int nCars, nCams; IpCar cars[kIpCars]; IpCam cams[kIpCams]; };
+static IpSnap g_ipRing[kIpRing];
+static int    g_ipHead = 0, g_ipCount = 0, g_ipLastIdx = 0;
+static LONGLONG g_ipLastStepQpc = 0;
+
+struct IpVeh { DWORD veh, car; unsigned long long seen; };
+static IpVeh  g_ipVehs[kIpCars]; static int g_ipNVehs = 0;
+static DWORD  g_ipOwners[kIpCams]; static int g_ipNOwners = 0;
+static DWORD  g_ipPendingCar = 0, g_ipPendingVeh = 0;
+
+// statistics
+static unsigned long g_ipFrames = 0, g_ipFramesBlended = 0, g_ipAhead = 0, g_ipBehind = 0,
+                     g_ipCarsBlended = 0, g_ipCarsPass = 0, g_ipCarMismatch = 0, g_ipCarJump = 0,
+                     g_ipCamsBlended = 0, g_ipCamCut = 0, g_ipCamMismatch = 0, g_ipResets = 0,
+                     g_ipClockSnaps = 0, g_ipSteps = 0, g_ipDrawListB = 0, g_ipDrawSimCar = 0;
+static double g_ipAlphaSum = 0;
+
+// --- frame display time --------------------------------------------------
+// With the limiter on, a frame drawn now reaches the screen at the next
+// deadline. Without it, follow the frame start times with a light filter.
+static LONGLONG g_ftLast = 0, g_ftInterval = 0, g_frameTime = 0;
+static unsigned long long g_frameTimeFor = ~0ull;
+static LONGLONG SmoothedNow() {
+    LONGLONG now = QpcNow();
+    if (!g_ftLast) { g_ftLast = now; return now; }
+    LONGLONG d = now - g_ftLast;
+    if (!g_ftInterval) g_ftInterval = d;
+    LONGLONG pred = g_ftLast + g_ftInterval, err = now - pred, ft;
+    if (g_ftInterval > 0 && err < g_ftInterval / 2 && err > -g_ftInterval / 2) {
+        ft = pred + err / 8;
+        g_ftInterval += (d - g_ftInterval) / 16;
+    } else {
+        ft = now;
+        if (d > 0 && d < g_qpcFreq.QuadPart / 10) g_ftInterval = d;
+    }
+    g_ftLast = ft;
+    return ft;
+}
+static LONGLONG FrameDisplayTime() {
+    if (g_frameTimeFor != g_presentCount) {
+        g_frameTimeFor = g_presentCount;
+        LONGLONG sm = SmoothedNow();
+        g_frameTime = g_nextDeadline ? g_nextDeadline : sm;
+    }
+    return g_frameTime;
+}
+
+// --- step clock -------------------------------------------------------------
+// E(t) = continuous step index, following step arrivals gently; its rate is
+// 60 steps per second times the game's time scale (slow motion).
+static bool     g_ipClockValid = false;
+static double   g_ipE0 = 0;   static LONGLONG g_ipT0 = 0;
+static double   g_ipPeriod = 0;               // QPC ticks per step
+static double StepPeriodNow() {
+    float sc = 1.0f;
+    SafeRead(hp2::pTimeScale, &sc);
+    if (!(sc > 0.05f)) sc = 0.05f;
+    if (sc > 4.0f) sc = 4.0f;
+    return (double)g_qpcFreq.QuadPart / 60.0 / (double)sc;
+}
+static double ClockAt(LONGLONG t) { return g_ipE0 + (double)(t - g_ipT0) / g_ipPeriod; }
+static void ClockOnStep(int idx, LONGLONG t) {
+    double p = StepPeriodNow();
+    if (!g_ipClockValid) {
+        g_ipE0 = idx; g_ipT0 = t; g_ipPeriod = p; g_ipClockValid = true; return;
+    }
+    double e = ClockAt(t);
+    g_ipE0 = e; g_ipT0 = t;                       // rebase (also when the rate changes)
+    if (fabs(p - g_ipPeriod) > g_ipPeriod * 0.02) g_ipPeriod = p;
+    double err = (double)idx - e;
+    if (err > 3.0 || err < -3.0) { g_ipE0 = idx; g_ipClockSnaps++; }
+    else g_ipE0 += err / 32.0;
+}
+
+// --- snapshots ----------------------------------------------------------------
+static bool ReadBody(DWORD veh, float* x) {
+    DWORD body = 0;
+    if (!SafeRead(veh + 0x6E8, &body) || !body) return false;
+    if (IsBadReadPtr(reinterpret_cast<void*>(body + 0x2A8), 48)) return false;
+    memcpy(x, reinterpret_cast<void*>(body + 0x2A8), 48);
+    return true;
+}
+static DWORD ActiveCamera(DWORD owner, DWORD* idOut) {
+    DWORD slot = 0, id = 0, list = 0, n = 0;
+    if (!SafeRead(owner + 0x164, &slot) || slot > 10) return 0;
+    if (!SafeRead(owner + 0x138 + slot * 4, &id)) return 0;
+    if (!SafeRead(owner + 4, &list) || !SafeRead(owner + 8, &n) || !list || n > 64) return 0;
+    for (DWORD i = 0; i < n; i++) {
+        DWORD cam = 0, cid = 0;
+        if (!SafeRead(list + i * 4, &cam) || !cam || !SafeRead(cam + 0x68, &cid)) continue;
+        if (cid == id) { if (idOut) *idOut = id; return cam; }
+    }
+    return 0;
+}
+static bool ReadCam(DWORD cam, float* f) {
+    if (IsBadReadPtr(reinterpret_cast<void*>(cam + 8), 0x44)) return false;
+    memcpy(f, reinterpret_cast<void*>(cam + 8), 7 * 4);          // eye, target, fov
+    memcpy(f + 7, reinterpret_cast<void*>(cam + 0x40), 3 * 4);   // up
+    return true;
+}
+static void WriteCam(DWORD cam, const float* f) {
+    memcpy(reinterpret_cast<void*>(cam + 8), f, 7 * 4);
+    memcpy(reinterpret_cast<void*>(cam + 0x40), f + 7, 3 * 4);
+}
+
+static void OnStep(int idx) {
+    g_ipSteps++;
+    LONGLONG t = FrameDisplayTime();
+    if (g_ipCount && (idx <= g_ipLastIdx || idx - g_ipLastIdx > 16)) {
+        g_ipCount = 0; g_ipClockValid = false; g_ipResets++;     // restart / jump
+    }
+    g_ipLastIdx = idx;
+    g_ipLastStepQpc = QpcNow();
+    g_ipHead = (g_ipHead + 1) % kIpRing;
+    IpSnap& s = g_ipRing[g_ipHead];
+    s.idx = idx; s.nCars = 0; s.nCams = 0;
+    for (int i = 0; i < g_ipNVehs; i++)
+        if (ReadBody(g_ipVehs[i].veh, s.cars[s.nCars].x)) s.cars[s.nCars++].veh = g_ipVehs[i].veh;
+    for (int i = 0; i < g_ipNOwners; i++) {
+        IpCam& c = s.cams[s.nCams];
+        c.owner = g_ipOwners[i];
+        c.cam = ActiveCamera(c.owner, &c.activeId);
+        if (c.cam && ReadCam(c.cam, c.f)) s.nCams++;
+    }
+    if (g_ipCount < kIpRing) g_ipCount++;
+    ClockOnStep(idx, t);
+}
+
+static void __cdecl Hook_WorldStep(int step) {
+    reinterpret_cast<WorldStep_t>(hp2::fnWorldStep)(step);
+    if (!*reinterpret_cast<volatile BYTE*>(hp2::pReplayFlag)) OnStep(step + 1);
+}
+
+// --- per-frame blend position -------------------------------------------------
+struct IpFrame { bool ok; const IpSnap* A; const IpSnap* B; float t; };
+static IpFrame g_ipFrame; static unsigned long long g_ipFrameFor = ~0ull;
+static const IpFrame& FrameBlend() {
+    if (g_ipFrameFor == g_presentCount) return g_ipFrame;
+    g_ipFrameFor = g_presentCount;
+    IpFrame& f = g_ipFrame; f.ok = false;
+    g_ipFrames++;
+    if (!g_cfg.interpolate || g_ipCount < 2 || !g_ipClockValid) return f;
+    if (QpcNow() - g_ipLastStepQpc > g_qpcFreq.QuadPart / 4) return f;   // paused / replay
+    double r = ClockAt(FrameDisplayTime()) - g_cfg.interpDelay;
+    const IpSnap* newest = &g_ipRing[g_ipHead];
+    if (r >= (double)newest->idx) { g_ipAhead++; return f; }           // newest is the best we have
+    const IpSnap *A = nullptr, *B = nullptr;
+    for (int k = 0; k + 1 < g_ipCount; k++) {
+        const IpSnap* nb = &g_ipRing[(g_ipHead - k + kIpRing) % kIpRing];
+        const IpSnap* na = &g_ipRing[(g_ipHead - k - 1 + kIpRing) % kIpRing];
+        if (r >= (double)na->idx) { A = na; B = nb; break; }
+    }
+    if (!A) {
+        int k = g_ipCount - 2;
+        B = &g_ipRing[(g_ipHead - k + kIpRing) % kIpRing];
+        A = &g_ipRing[(g_ipHead - k - 1 + kIpRing) % kIpRing];
+        r = A->idx; g_ipBehind++;
+    }
+    int span = B->idx - A->idx;
+    if (span <= 0 || span > 8) return f;
+    double t = (r - A->idx) / span;
+    f.t = (float)(t < 0 ? 0 : t > 1 ? 1 : t);
+    f.A = A; f.B = B; f.ok = true;
+    g_ipFramesBlended++; g_ipAlphaSum += f.t;
+    return f;
+}
+
+// --- blending math -------------------------------------------------------------
+struct IpQuat { float w, x, y, z; };
+static IpQuat MatToQuat(const float* m) {   // row-major 3x3
+    IpQuat q; float tr = m[0] + m[4] + m[8];
+    if (tr > 0) { float s = sqrtf(tr + 1.0f) * 2; q.w = 0.25f * s; q.x = (m[7] - m[5]) / s;
+                  q.y = (m[2] - m[6]) / s; q.z = (m[3] - m[1]) / s; }
+    else if (m[0] > m[4] && m[0] > m[8]) { float s = sqrtf(1.0f + m[0] - m[4] - m[8]) * 2;
+                  q.w = (m[7] - m[5]) / s; q.x = 0.25f * s; q.y = (m[1] + m[3]) / s; q.z = (m[2] + m[6]) / s; }
+    else if (m[4] > m[8]) { float s = sqrtf(1.0f + m[4] - m[0] - m[8]) * 2;
+                  q.w = (m[2] - m[6]) / s; q.x = (m[1] + m[3]) / s; q.y = 0.25f * s; q.z = (m[5] + m[7]) / s; }
+    else { float s = sqrtf(1.0f + m[8] - m[0] - m[4]) * 2;
+                  q.w = (m[3] - m[1]) / s; q.x = (m[2] + m[6]) / s; q.y = (m[5] + m[7]) / s; q.z = 0.25f * s; }
+    return q;
+}
+static void QuatToMat(const IpQuat& q, float* m) {
+    float xx = q.x*q.x, yy = q.y*q.y, zz = q.z*q.z, xy = q.x*q.y, xz = q.x*q.z, yz = q.y*q.z,
+          wx = q.w*q.x, wy = q.w*q.y, wz = q.w*q.z;
+    m[0] = 1 - 2*(yy+zz); m[1] = 2*(xy-wz);     m[2] = 2*(xz+wy);
+    m[3] = 2*(xy+wz);     m[4] = 1 - 2*(xx+zz); m[5] = 2*(yz-wx);
+    m[6] = 2*(xz-wy);     m[7] = 2*(yz+wx);     m[8] = 1 - 2*(xx+yy);
+}
+static bool IsRotation(const float* m) {
+    for (int r = 0; r < 3; r++) {
+        float l = m[r*3]*m[r*3] + m[r*3+1]*m[r*3+1] + m[r*3+2]*m[r*3+2];
+        if (fabsf(l - 1.0f) > 0.02f) return false;
+    }
+    float det = m[0]*(m[4]*m[8]-m[5]*m[7]) - m[1]*(m[3]*m[8]-m[5]*m[6]) + m[2]*(m[3]*m[7]-m[4]*m[6]);
+    return fabsf(det - 1.0f) < 0.05f;
+}
+// a, b: pos(3) + rot(9). Returns false if the pair shouldn't be blended.
+static bool BlendXform(const float* a, const float* b, float t, float* out) {
+    float dx = b[0]-a[0], dy = b[1]-a[1], dz = b[2]-a[2];
+    if (dx*dx + dy*dy + dz*dz > g_cfg.maxStepDistance * g_cfg.maxStepDistance) return false;
+    for (int i = 0; i < 3; i++) out[i] = a[i] + (b[i] - a[i]) * t;
+    const float *ma = a + 3, *mb = b + 3; float* mo = out + 3;
+    if (!memcmp(ma, mb, 36)) { memcpy(mo, mb, 36); return true; }
+    if (!IsRotation(ma) || !IsRotation(mb)) {
+        for (int i = 0; i < 9; i++) mo[i] = ma[i] + (mb[i] - ma[i]) * t;
+        return true;
+    }
+    IpQuat qa = MatToQuat(ma), qb = MatToQuat(mb);
+    float d = qa.w*qb.w + qa.x*qb.x + qa.y*qb.y + qa.z*qb.z;
+    if (d < 0) { qb.w = -qb.w; qb.x = -qb.x; qb.y = -qb.y; qb.z = -qb.z; d = -d; }
+    if (d > 1) d = 1;
+    if (2.0f * acosf(d) * 57.29578f > g_cfg.maxStepAngle) return false;
+    IpQuat q;
+    if (d > 0.9995f) {
+        q.w = qa.w + (qb.w-qa.w)*t; q.x = qa.x + (qb.x-qa.x)*t;
+        q.y = qa.y + (qb.y-qa.y)*t; q.z = qa.z + (qb.z-qa.z)*t;
+    } else {
+        float th = acosf(d), s = sinf(th), wa = sinf((1-t)*th)/s, wb = sinf(t*th)/s;
+        q.w = qa.w*wa + qb.w*wb; q.x = qa.x*wa + qb.x*wb; q.y = qa.y*wa + qb.y*wb; q.z = qa.z*wa + qb.z*wb;
+    }
+    float l = sqrtf(q.w*q.w + q.x*q.x + q.y*q.y + q.z*q.z);
+    if (l < 1e-6f) return false;
+    q.w /= l; q.x /= l; q.y /= l; q.z /= l;
+    QuatToMat(q, mo);
+    return true;
+}
+// physics space -> what 0x4CA860 hands to SetTransform (z flipped)
+static void ToRenderSpace(const float* x, float* pos, float* rot) {
+    pos[0] = x[0]; pos[1] = x[1]; pos[2] = -x[2];
+    const float* m = x + 3;
+    rot[0] = m[0];  rot[1] = m[1];  rot[2] = -m[2];
+    rot[3] = m[3];  rot[4] = m[4];  rot[5] = -m[5];
+    rot[6] = -m[6]; rot[7] = -m[7]; rot[8] = m[8];
+}
+static bool NearlyEqual(const float* a, const float* b, int n) {
+    for (int i = 0; i < n; i++) {
+        float d = fabsf(a[i] - b[i]), s = fabsf(a[i]) + fabsf(b[i]);
+        if (d > 1e-4f * (1.0f + s)) return false;
+    }
+    return true;
+}
+static const IpCar* FindCar(const IpSnap* s, DWORD veh) {
+    for (int i = 0; i < s->nCars; i++) if (s->cars[i].veh == veh) return &s->cars[i];
+    return nullptr;
+}
+static const IpCam* FindCam(const IpSnap* s, DWORD owner) {
+    for (int i = 0; i < s->nCams; i++) if (s->cams[i].owner == owner) return &s->cams[i];
+    return nullptr;
+}
+
+// --- render-time hooks -------------------------------------------------------------
+static void RegisterVehicle(DWORD veh, DWORD car) {
+    for (int i = 0; i < g_ipNVehs; i++)
+        if (g_ipVehs[i].veh == veh) { g_ipVehs[i].car = car; g_ipVehs[i].seen = g_presentCount; return; }
+    // drop vehicles not drawn for 10 s worth of frames, then add
+    int w = 0;
+    for (int i = 0; i < g_ipNVehs; i++)
+        if (g_presentCount - g_ipVehs[i].seen < 2000) g_ipVehs[w++] = g_ipVehs[i];
+    g_ipNVehs = w;
+    if (g_ipNVehs < kIpCars) g_ipVehs[g_ipNVehs++] = { veh, car, g_presentCount };
+}
+
+static void __fastcall Hook_CarSetOwner(void* car, void*, void* veh) {
+    g_ipPendingCar = reinterpret_cast<DWORD>(car);
+    g_ipPendingVeh = reinterpret_cast<DWORD>(veh);
+    if (g_cfg.interpolate) RegisterVehicle(g_ipPendingVeh, g_ipPendingCar);
+    reinterpret_cast<CarSetOwner_t>(hp2::fnCarSetOwner)(car, nullptr, veh);
+}
+
+static void __fastcall Hook_CarSetXform(void* car, void*, void* view, const float* pos, const float* rot) {
+    if (g_cfg.interpolate && reinterpret_cast<DWORD>(car) == g_ipPendingCar && g_ipPendingVeh) {
+        const IpFrame& f = FrameBlend();
+        const IpCar* a = f.ok ? FindCar(f.A, g_ipPendingVeh) : nullptr;
+        const IpCar* b = f.ok ? FindCar(f.B, g_ipPendingVeh) : nullptr;
+        const IpCar* n = f.ok ? FindCar(&g_ipRing[g_ipHead], g_ipPendingVeh) : nullptr;
+        if (a && b && n) {
+            float np[3], nr[9];
+            ToRenderSpace(n->x, np, nr);
+            // only if the newest snapshot is still what the game is drawing
+            if (NearlyEqual(np, pos, 3) && NearlyEqual(nr, rot, 9)) {
+                float x[12];
+                if (BlendXform(a->x, b->x, f.t, x)) {
+                    float p[3], m[9];
+                    ToRenderSpace(x, p, m);
+                    g_ipCarsBlended++;
+                    reinterpret_cast<CarSetXform_t>(hp2::fnCarSetXform)(car, nullptr, view, p, m);
+                    return;
+                }
+                g_ipCarJump++;
+            } else g_ipCarMismatch++;
+        }
+        g_ipCarsPass++;
+    }
+    reinterpret_cast<CarSetXform_t>(hp2::fnCarSetXform)(car, nullptr, view, pos, rot);
+}
+
+static DWORD __fastcall Hook_BuildView(void* ownerP, void*, DWORD a, DWORD b, DWORD c) {
+    BuildView_t orig = reinterpret_cast<BuildView_t>(hp2::fnBuildView);
+    DWORD owner = reinterpret_cast<DWORD>(ownerP);
+    if (!g_cfg.interpolate || !g_cfg.interpolateCamera) return orig(ownerP, nullptr, a, b, c);
+    bool known = false;
+    for (int i = 0; i < g_ipNOwners; i++) if (g_ipOwners[i] == owner) known = true;
+    if (!known && g_ipNOwners < kIpCams) g_ipOwners[g_ipNOwners++] = owner;
+    const IpFrame& f = FrameBlend();
+    if (f.ok) {
+        const IpCam* ca = FindCam(f.A, owner);
+        const IpCam* cb = FindCam(f.B, owner);
+        const IpCam* cn = FindCam(&g_ipRing[g_ipHead], owner);
+        DWORD id = 0, cam = ActiveCamera(owner, &id);
+        float cur[10];
+        if (ca && cb && cn && cam && ReadCam(cam, cur)) {
+            if (ca->cam != cb->cam || cb->cam != cam || cn->cam != cam ||
+                ca->activeId != cb->activeId || cb->activeId != id) {
+                g_ipCamCut++;                                   // camera switched between the steps
+            } else if (!NearlyEqual(cur, cn->f, 10)) {
+                g_ipCamMismatch++;                              // moved outside a step
+            } else {
+                float dx = cb->f[0]-ca->f[0], dy = cb->f[1]-ca->f[1], dz = cb->f[2]-ca->f[2];
+                if (dx*dx + dy*dy + dz*dz > g_cfg.maxStepDistance * g_cfg.maxStepDistance) {
+                    g_ipCamCut++;
+                } else {
+                    float bl[10];
+                    for (int i = 0; i < 10; i++) bl[i] = ca->f[i] + (cb->f[i] - ca->f[i]) * f.t;
+                    WriteCam(cam, bl);
+                    DWORD r = orig(ownerP, nullptr, a, b, c);
+                    WriteCam(cam, cur);
+                    g_ipCamsBlended++;
+                    return r;
+                }
+            }
+        }
+    }
+    return orig(ownerP, nullptr, a, b, c);
+}
+
+static void __fastcall Hook_DrawListB(void* car, void*, void* view) {
+    g_ipDrawListB++;
+    reinterpret_cast<CarDraw_t>(hp2::fnCarDraw)(car, nullptr, view);
+}
+static void __fastcall Hook_DrawSimCar(void* car, void*, void* view) {
+    g_ipDrawSimCar++;
+    reinterpret_cast<CarDraw_t>(hp2::fnCarDraw)(car, nullptr, view);
+}
+
+static void InstallInterpolation() {
+    if (!g_knownExe || !g_cfg.interpolate) { Logf("interpolation: off\n"); return; }
+    bool ok = PatchCallRel32(hp2::callWorldStep,   (void*)&Hook_WorldStep) &&
+              PatchCallRel32(hp2::callCarSetOwner, (void*)&Hook_CarSetOwner) &&
+              PatchCallRel32(hp2::callCarSetXform, (void*)&Hook_CarSetXform) &&
+              PatchCallRel32(hp2::callBuildView1,  (void*)&Hook_BuildView) &&
+              PatchCallRel32(hp2::callBuildView2,  (void*)&Hook_BuildView) &&
+              PatchCallRel32(hp2::callDrawListB,   (void*)&Hook_DrawListB) &&
+              PatchCallRel32(hp2::callDrawSimCar,  (void*)&Hook_DrawSimCar);
+    Logf("interpolation: %s (camera=%d, delay=%.2f steps)\n", ok ? "installed" : "patch FAILED",
+         g_cfg.interpolateCamera, g_cfg.interpDelay);
+}
+
+static void LogInterpStats() {
+    if (!g_cfg.interpolate || !g_knownExe) return;
+    Logf("  interp: steps=%lu frames=%lu blended=%lu (avg t %.2f) ahead=%lu behind=%lu | cars blended=%lu "
+         "passed=%lu (mismatch %lu, jump %lu) | camera blended=%lu cuts=%lu mismatch=%lu | resets=%lu "
+         "clock snaps=%lu | tracked cars=%d views=%d | other car draws: listB=%lu sim-placed=%lu\n",
+         g_ipSteps, g_ipFrames, g_ipFramesBlended, g_ipFramesBlended ? g_ipAlphaSum / g_ipFramesBlended : 0.0,
+         g_ipAhead, g_ipBehind, g_ipCarsBlended, g_ipCarsPass, g_ipCarMismatch, g_ipCarJump,
+         g_ipCamsBlended, g_ipCamCut, g_ipCamMismatch, g_ipResets, g_ipClockSnaps, g_ipNVehs,
+         g_ipNOwners, g_ipDrawListB, g_ipDrawSimCar);
+    g_ipSteps = g_ipFrames = g_ipFramesBlended = g_ipAhead = g_ipBehind = g_ipCarsBlended =
+        g_ipCarsPass = g_ipCarMismatch = g_ipCarJump = g_ipCamsBlended = g_ipCamCut =
+        g_ipCamMismatch = g_ipResets = g_ipClockSnaps = g_ipDrawListB = g_ipDrawSimCar = 0;
+    g_ipAlphaSum = 0;
+}
+
 static void LogStats() {
     if (!g_log) return;
     if (g_intervalCount) {
@@ -1141,6 +1610,7 @@ static void LogStats() {
             Logf("  sim ticks per frame: 0:%lu 1:%lu 2:%lu 3:%lu 4+:%lu | scheduler fires=%lu resyncs=%lu\n",
                  g_tpfHist[0], g_tpfHist[1], g_tpfHist[2], g_tpfHist[3], g_tpfHist[4],
                  g_tickFires.exchange(0), g_tickResyncs.exchange(0));
+        LogInterpStats();
     }
     memset(g_tpfHist, 0, sizeof(g_tpfHist));
     g_minDelta = 1e9; g_maxDelta = 0.0; g_sumDelta = 0.0; g_intervalCount = 0;
@@ -1327,6 +1797,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
         InstallPropsPatch();
         InstallParticlesPatch();
         InstallCharacterAnimPatch();
+        InstallInterpolation();
 
         if (PatchIAT_Direct3DCreate8())
             Logf("D3D IAT patch OK\n");
