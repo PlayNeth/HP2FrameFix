@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.16
+// HP2FrameFix.asi  v0.16.1
 // HD car reflections section: GPL-3.0 (derived from NFSHP2 HD Reflections by
 // Arctic94 / NFS HD Reflections by Aero_) - see the "HD car reflections" section.
 // Frame pacing, game clock fix, EAX-on-startup fix and loading speed-up
@@ -9,6 +9,11 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.16.1: sun glints / reflections on the car no longer wobble with interpolation.
+//    The cubemap update (0x53E380) aims the sphere map at the camera eye (read
+//    through the view, 0x40CFD0) and, in one mode, along the body rotation
+//    (body+0x2B4) - both were the raw physics-step values while the car and
+//    view were drawn blended. The update now sees the blended camera and body.
 // v0.16: HD car reflections built in (hdReflections and refl* keys), including
 //    the fix for the cubemap's alternating halves (seam flicker).
 // v0.15.6: the car reflection probe (cubemap update, 0x4D7985) gets the car's
@@ -171,7 +176,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.16"
+#define HP2FF_VERSION "0.16.1"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -1673,6 +1678,26 @@ static bool CameraJumped(const float* a, const float* b) {
     return false;
 }
 
+// The blended camera used for this frame's view, per owner, so the reflection
+// update (which reads the camera eye itself) can see the same camera.
+struct IpViewCam { DWORD owner, cam; unsigned long frame; float f[10]; };
+static IpViewCam g_ipViewCams[kIpCams];
+static void RememberViewCam(DWORD owner, DWORD cam, const float* f) {
+    int slot = 0;
+    for (int i = 0; i < kIpCams; i++) {
+        if (g_ipViewCams[i].owner == owner) { slot = i; break; }
+        if (g_ipViewCams[i].frame < g_ipViewCams[slot].frame) slot = i;
+    }
+    IpViewCam& v = g_ipViewCams[slot];
+    v.owner = owner; v.cam = cam; v.frame = g_presentCount; memcpy(v.f, f, sizeof(v.f));
+}
+static const IpViewCam* FindViewCam(DWORD owner) {
+    for (int i = 0; i < kIpCams; i++)
+        if (g_ipViewCams[i].owner == owner && g_ipViewCams[i].frame == g_presentCount && g_ipViewCams[i].cam)
+            return &g_ipViewCams[i];
+    return nullptr;
+}
+
 static void MarkCutFrame() {
     if (g_ipCutFrame != g_presentCount) { g_ipCutFrame = g_presentCount; g_ipCutFrames++; }
 }
@@ -1704,6 +1729,7 @@ static DWORD __fastcall Hook_BuildView(void* ownerP, void*, DWORD a, DWORD b, DW
                     float bl[10];
                     for (int i = 0; i < 10; i++) bl[i] = ca->f[i] + (cb->f[i] - ca->f[i]) * f.t;
                     WriteCam(cam, bl);
+                    RememberViewCam(owner, cam, bl);
                     DWORD r = orig(ownerP, nullptr, a, b, c);
                     WriteCam(cam, cur);
                     g_ipCamsBlended++;
@@ -1722,6 +1748,7 @@ static DWORD __fastcall Hook_BuildView(void* ownerP, void*, DWORD a, DWORD b, DW
 namespace hp2 { const DWORD callReflUpdate = 0x4D7985; const DWORD fnReflUpdate = 0x53E7E0; }
 typedef void (__fastcall *ReflUpdate_t)(void* mgr, void* edx, void* view, const float* pos);
 static unsigned long g_ipReflBlended = 0, g_ipReflPass = 0;
+static unsigned long g_ipReflCamBlended = 0;
 static void __fastcall Hook_ReflUpdate(void* mgr, void*, void* view, const float* pos) {
     ReflUpdate_t orig = reinterpret_cast<ReflUpdate_t>(hp2::fnReflUpdate);
     if (g_cfg.interpolate && pos && g_ipCutFrame != g_presentCount) {
@@ -1740,7 +1767,21 @@ static void __fastcall Hook_ReflUpdate(void* mgr, void*, void* view, const float
                 float bp[3], br[9];
                 ToRenderSpace(x, bp, br);
                 g_ipReflBlended++;
+                // The update orients the sphere map from the camera eye (read
+                // through the view) or, in one mode, from the body rotation at
+                // body+0x2B4. Show it the blended ones for the call.
+                DWORD body = 0, cam = 0;
+                float rawRot[9], rawCam[10];
+                SafeRead(n->cars[i].veh + 0x6E8, &body);
+                bool bodyOk = body && !IsBadWritePtr(reinterpret_cast<void*>(body + 0x2B4), 36) &&
+                              NearlyEqual(reinterpret_cast<const float*>(body + 0x2A8), n->cars[i].x, 12);
+                if (bodyOk) { memcpy(rawRot, reinterpret_cast<void*>(body + 0x2B4), 36);
+                              memcpy(reinterpret_cast<void*>(body + 0x2B4), x + 3, 36); }
+                const IpViewCam* vc = FindViewCam(reinterpret_cast<DWORD>(view));
+                if (vc && ReadCam(vc->cam, rawCam)) { cam = vc->cam; WriteCam(cam, vc->f); g_ipReflCamBlended++; }
                 orig(mgr, nullptr, view, bp);
+                if (cam) WriteCam(cam, rawCam);
+                if (bodyOk) memcpy(reinterpret_cast<void*>(body + 0x2B4), rawRot, 36);
                 return;
             }
         }
@@ -1777,12 +1818,12 @@ static void LogInterpStats() {
     Logf("  interp: steps=%lu frames=%lu blended=%lu (avg t %.2f) ahead=%lu behind=%lu | cars blended=%lu "
          "passed=%lu (mismatch %lu, jump %lu) | camera blended=%lu cuts=%lu mismatch=%lu (cut frames %lu) | resets=%lu "
          "clock snaps=%lu | tracked cars=%d views=%d | other car draws: listB=%lu sim-placed=%lu | "
-         "reflection probe blended=%lu passed=%lu\n",
+         "reflection probe blended=%lu (camera %lu) passed=%lu\n",
          g_ipSteps, g_ipFrames, g_ipFramesBlended, g_ipFramesBlended ? g_ipAlphaSum / g_ipFramesBlended : 0.0,
          g_ipAhead, g_ipBehind, g_ipCarsBlended, g_ipCarsPass, g_ipCarMismatch, g_ipCarJump,
          g_ipCamsBlended, g_ipCamCut, g_ipCamMismatch, g_ipCutFrames, g_ipResets, g_ipClockSnaps, g_ipNVehs,
-         g_ipNOwners, g_ipDrawListB, g_ipDrawSimCar, g_ipReflBlended, g_ipReflPass);
-    g_ipReflBlended = g_ipReflPass = 0;
+         g_ipNOwners, g_ipDrawListB, g_ipDrawSimCar, g_ipReflBlended, g_ipReflCamBlended, g_ipReflPass);
+    g_ipReflBlended = g_ipReflPass = g_ipReflCamBlended = 0;
     g_ipSteps = g_ipFrames = g_ipFramesBlended = g_ipAhead = g_ipBehind = g_ipCarsBlended =
         g_ipCarsPass = g_ipCarMismatch = g_ipCarJump = g_ipCamsBlended = g_ipCamCut =
         g_ipCamMismatch = g_ipResets = g_ipClockSnaps = g_ipDrawListB = g_ipDrawSimCar = g_ipCutFrames = 0;
