@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.17.5
+// HP2FrameFix.asi  v0.17.6
 // Widescreen section: based on HP2WSFix (MIT, Lovro Pleše) - see that section.
 // HD car reflections section: GPL-3.0 (derived from NFSHP2 HD Reflections by
 // Arctic94 / NFS HD Reflections by Aero_) - see the "HD car reflections" section.
@@ -10,6 +10,8 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.17.6: showroom cars were stretched sideways: their viewport is wider than
+//    4:3 once the menus are centered - big 3D views of any shape get Hor+.
 // v0.17.5: v0.17.4's FMV column crop removed (its viewport stayed set for the race).
 // v0.17.3: centered text was off to the right: the text measuring code converts
 //    a size with the screen->layout function, which must not subtract the
@@ -197,7 +199,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.17.5"
+#define HP2FF_VERSION "0.17.6"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -2543,7 +2545,9 @@ static void __fastcall Ws_Projection(void* view, void*, float fov, float aspect,
     if (g_cfg.widescreen && g_cfg.wsFixFOV && fabsf(aspect - 4.0f / 3.0f) < 0.02f) {
         int vw = *reinterpret_cast<int*>(reinterpret_cast<BYTE*>(view) + 0x14);
         int vh = *reinterpret_cast<int*>(reinterpret_cast<BYTE*>(view) + 0x18);
-        if (vw > 0 && vh > 0 && vw >= ws::scrW - 2 && vh >= ws::scrH - 2) {
+        // big views (race view, showroom car; their viewport can be wider than
+        // 4:3 now that nothing clips it to the 800x600 area) - not the mirror
+        if (vw > 0 && vh > 0 && vw * 2 >= ws::scrW && vh * 2 >= ws::scrH) {
             float a = (float)vw / vh;
             if (fabsf(a - aspect) > 0.01f && fov > 1.0f && fov < 179.0f) {
                 const float d2r = 3.14159265f / 180.0f;
