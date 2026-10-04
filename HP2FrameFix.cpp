@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.15.4
+// HP2FrameFix.asi  v0.15.5
 // Frame pacing, game clock fix, EAX-on-startup fix and loading speed-up
 // for Need for Speed: Hot Pursuit 2 (PC)
 //
@@ -7,11 +7,12 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
-// v0.15.4: shift animation pacing - gear changes during a shift are folded into
-//    it instead of queueing another full (~1 s) shift, and shifting straight
-//    back to the previous gear within 2 s isn't animated (quick up/down shifts,
-//    automatic gearbox hunting). Previously each queued shift played in full, so
-//    the driver kept reaching for the shifter long after the last change.
+// v0.15.5: shift animation pacing reworked - every gear change is animated
+//    again (v0.15.4 skipped quick back-and-forth shifts, like the vanilla game
+//    skipping them). A change during a shift extends it: the hand stays at the
+//    shifter and returns ~0.5 s after the last change, instead of queueing.
+// v0.15.4: gear changes during a shift folded into it; quick back-and-forth
+//    shifts not animated (replaced in v0.15.5).
 // v0.15.3: fixed the driver sometimes repeating the gear-shift animation forever.
 //    The clip selector (0x42E6B0) ends a shift when the anim's "looped" flag is
 //    set; with fractional animation advances a later small advance could clear
@@ -163,7 +164,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.15.4"
+#define HP2FF_VERSION "0.15.5"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -1101,39 +1102,28 @@ static void __fastcall Hook_SelectorPlayAnim(void* actor, void*, DWORD id, DWORD
 
 // Shift animation pacing. The selector (0x42E6B0, this = CarModel+0x358) starts
 // a ~1 s shift clip (0x16317 / 0x1631B) whenever the gear differs from the one it
-// last animated ([sel+0x1C]); changes during a shift queue up, so quick up/down
-// shifts or the automatic gearbox hunting between two gears kept the hand on the
-// shifter for seconds. Gear changes during a shift are now folded into it, and a
-// change straight back to the previous gear within 2 s isn't animated.
+// last animated ([sel+0x1C]); changes made during a shift used to queue up, so
+// quick up/down shifting kept replaying the clip long after the last change.
+// Now a change during a shift extends it instead: the gear is taken as
+// animated, and if the clip is already past its middle (hand at the shifter)
+// it's held there, so the hand returns to the wheel ~0.5 s after the last change.
 namespace hp2 { const DWORD callSelector = 0x42BEEE; const DWORD fnSelector = 0x42E6B0; }
 typedef void (__fastcall *Selector_t)(void* sel, void* edx, int arg);
-struct ShiftState { DWORD sel; int prevGear, toGear; int shiftStep; };
-static ShiftState g_shift[32]; static int g_shiftN = 0;
-static ShiftState* ShiftFor(DWORD sel) {
-    for (int i = 0; i < g_shiftN; i++) if (g_shift[i].sel == sel) return &g_shift[i];
-    if (g_shiftN < 32) { g_shift[g_shiftN] = { sel, -1, -1, -100000 }; return &g_shift[g_shiftN++]; }
-    g_shift[0] = { sel, -1, -1, -100000 }; return &g_shift[0];   // table full: reuse
-}
 static void __fastcall Hook_Selector(void* selP, void*, int arg) {
     DWORD sel = reinterpret_cast<DWORD>(selP), actor = 0, car = 0;
     int id = -1, lastGear = -1; BYTE gear = 0;
     if (SafeRead(sel + 0x34, &actor) && actor && SafeRead(sel + 0x18, &car) && car &&
-        SafeRead(actor + 0x5C, &id) && SafeRead(car + 0x630, &gear) && SafeRead(sel + 0x1C, &lastGear) &&
-        (int)gear != lastGear) {
-        ShiftState* st = ShiftFor(sel);
-        int step = *reinterpret_cast<volatile int*>(hp2::pStepCounter);
-        bool shifting = (id == 0x16317 || id == 0x1631B);
-        // back and forth between the last two gears within 2 s of the last change
-        bool hunting = ((int)gear == st->prevGear || (int)gear == st->toGear) &&
-                       (lastGear == st->prevGear || lastGear == st->toGear) &&
-                       step - st->shiftStep >= 0 && step - st->shiftStep < 120;
-        if (shifting || hunting) {
-            *reinterpret_cast<int*>(sel + 0x1C) = gear;          // absorbed: no new shift clip
-            if (hunting) st->shiftStep = step;                    // keep absorbing while it hunts
-        } else {
-            st->prevGear = lastGear;                              // this change will be animated
-            st->toGear = gear;
-            st->shiftStep = step;
+        SafeRead(actor + 0x5C, &id) && (id == 0x16317 || id == 0x1631B) &&
+        SafeRead(car + 0x630, &gear) && SafeRead(sel + 0x1C, &lastGear) && (int)gear != lastGear) {
+        *reinterpret_cast<int*>(sel + 0x1C) = gear;               // no queued second shift
+        AnimChannelSet* cs = reinterpret_cast<AnimChannelSet*>(actor + 0x34);
+        if (cs->count > 0 && cs->count <= 16 && cs->channels &&
+            !IsBadWritePtr(cs->channels, cs->count * sizeof(AnimChannel))) {
+            for (int i = 0; i < cs->count; ++i) {
+                AnimChannel& ch = cs->channels[i];
+                float mid = ch.length * 0.5f;
+                if (ch.length > 0.0f && ch.time > mid) { ch.time = mid; ch.prevTime = mid; }
+            }
         }
     }
     reinterpret_cast<Selector_t>(hp2::fnSelector)(selP, nullptr, arg);
