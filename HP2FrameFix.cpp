@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.16.2
+// HP2FrameFix.asi  v0.16.3
 // HD car reflections section: GPL-3.0 (derived from NFSHP2 HD Reflections by
 // Arctic94 / NFS HD Reflections by Aero_) - see the "HD car reflections" section.
 // Frame pacing, game clock fix, EAX-on-startup fix and loading speed-up
@@ -9,6 +9,11 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.16.3: the blended camera now stays in the camera object for the whole frame
+//    render instead of only during BuildView. Each car copies the camera eye in
+//    CarSetXform (0x42B940 -> car+0xB60) for its sun specular, so the glints
+//    were computed from the raw step camera - up to a step away at speed. The
+//    raw camera is put back before the next physics step and at Present.
 // v0.16.2: v0.16.1 also swapped the body rotation during the cubemap update;
 //    the game caches the car's draw transform there, so the player car was
 //    drawn unblended (cars mismatch ~1 per frame). Removed; camera part kept.
@@ -179,7 +184,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.16.2"
+#define HP2FF_VERSION "0.16.3"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -1470,6 +1475,35 @@ static void WriteCam(DWORD cam, const float* f) {
     memcpy(reinterpret_cast<void*>(cam + 0x40), f + 7, 3 * 4);
 }
 
+// The blended camera stays written into the camera object for the whole frame
+// render (not only during BuildView): CarSetXform (0x42B940) copies the camera
+// eye into each car (+0xB60) for its sun specular, and the reflection update
+// aims the sphere map at it. The raw camera goes back before the next physics
+// step and after Present, so the game's own camera update never sees blended
+// values. If the game wrote the camera itself meanwhile, its value is kept.
+struct IpCamOverride { DWORD cam; float raw[10], blended[10]; bool active; };
+static IpCamOverride g_ipCamOv[kIpCams];
+static IpCamOverride* FindCamOverride(DWORD cam) {
+    for (int i = 0; i < kIpCams; i++) if (g_ipCamOv[i].active && g_ipCamOv[i].cam == cam) return &g_ipCamOv[i];
+    return nullptr;
+}
+static void RestoreCamOverride(IpCamOverride* o) {
+    float now[10];
+    if (ReadCam(o->cam, now) && !memcmp(now, o->blended, sizeof(now))) WriteCam(o->cam, o->raw);
+    o->active = false;
+}
+static void RestoreCamOverrides() {
+    for (int i = 0; i < kIpCams; i++) if (g_ipCamOv[i].active) RestoreCamOverride(&g_ipCamOv[i]);
+}
+static void ApplyCamOverride(DWORD cam, const float* raw, const float* bl) {
+    IpCamOverride* o = FindCamOverride(cam);
+    if (!o) for (int i = 0; i < kIpCams && !o; i++) if (!g_ipCamOv[i].active) o = &g_ipCamOv[i];
+    if (!o) { RestoreCamOverrides(); o = &g_ipCamOv[0]; }
+    o->cam = cam; memcpy(o->raw, raw, sizeof(o->raw)); memcpy(o->blended, bl, sizeof(o->blended));
+    o->active = true;
+    WriteCam(cam, bl);
+}
+
 static void OnStep(int idx) {
     g_ipSteps++;
     LONGLONG t = FrameDisplayTime();
@@ -1494,6 +1528,7 @@ static void OnStep(int idx) {
 }
 
 static void __cdecl Hook_WorldStep(int step) {
+    RestoreCamOverrides();
     reinterpret_cast<WorldStep_t>(hp2::fnWorldStep)(step);
     if (!*reinterpret_cast<volatile BYTE*>(hp2::pReplayFlag)) OnStep(step + 1);
 }
@@ -1719,7 +1754,17 @@ static DWORD __fastcall Hook_BuildView(void* ownerP, void*, DWORD a, DWORD b, DW
         const IpCam* cn = FindCam(&g_ipRing[g_ipHead], owner);
         DWORD id = 0, cam = ActiveCamera(owner, &id);
         float cur[10];
-        if (ca && cb && cn && cam && ReadCam(cam, cur)) {
+        bool have = false;
+        if (cam) {
+            if (IpCamOverride* o = FindCamOverride(cam)) {
+                float now[10];
+                if (ReadCam(cam, now) && !memcmp(now, o->blended, sizeof(now))) {
+                    memcpy(cur, o->raw, sizeof(cur)); have = true;    // still ours: raw is the real state
+                } else o->active = false;                             // the game moved it meanwhile
+            }
+            if (!have) have = ReadCam(cam, cur);
+        }
+        if (ca && cb && cn && cam && have) {
             if (ca->cam != cb->cam || cb->cam != cam || cn->cam != cam ||
                 ca->activeId != cb->activeId || cb->activeId != id) {
                 g_ipCamCut++; MarkCutFrame();                   // camera switched between the steps
@@ -1731,16 +1776,16 @@ static DWORD __fastcall Hook_BuildView(void* ownerP, void*, DWORD a, DWORD b, DW
                 } else {
                     float bl[10];
                     for (int i = 0; i < 10; i++) bl[i] = ca->f[i] + (cb->f[i] - ca->f[i]) * f.t;
-                    WriteCam(cam, bl);
+                    ApplyCamOverride(cam, cur, bl);       // stays until the next step / Present
                     RememberViewCam(owner, cam, bl);
-                    DWORD r = orig(ownerP, nullptr, a, b, c);
-                    WriteCam(cam, cur);
                     g_ipCamsBlended++;
-                    return r;
+                    return orig(ownerP, nullptr, a, b, c);
                 }
             }
         }
     }
+    if (DWORD cam0 = ActiveCamera(owner, nullptr))                  // drawn unblended: raw camera
+        if (IpCamOverride* o = FindCamOverride(cam0)) RestoreCamOverride(o);
     return orig(ownerP, nullptr, a, b, c);
 }
 
@@ -1771,15 +1816,12 @@ static void __fastcall Hook_ReflUpdate(void* mgr, void*, void* view, const float
                 ToRenderSpace(x, bp, br);
                 g_ipReflBlended++;
                 // The update orients the sphere map toward the camera eye, read
-                // through the view (0x40CFD0) - show it the blended camera.
-                // (Don't touch the body: the game caches the car's draw
-                // transform from it during this call.)
-                DWORD cam = 0;
-                float rawCam[10];
+                // through the view (0x40CFD0). (Don't touch the body: the game
+                // caches the car's draw transform from it during this call.)
+                // (The blended camera stays in place for the whole frame since v0.16.3.)
                 const IpViewCam* vc = FindViewCam(reinterpret_cast<DWORD>(view));
-                if (vc && ReadCam(vc->cam, rawCam)) { cam = vc->cam; WriteCam(cam, vc->f); g_ipReflCamBlended++; }
+                if (vc && FindCamOverride(vc->cam)) g_ipReflCamBlended++;
                 orig(mgr, nullptr, view, bp);
-                if (cam) WriteCam(cam, rawCam);
                 return;
             }
         }
@@ -1864,6 +1906,7 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
     IDirect3DDevice8* This, CONST RECT* pSourceRect, CONST RECT* pDestRect,
     HWND hDestWindowOverride, CONST RGNDATA* pDirtyRegion)
 {
+    RestoreCamOverrides();                      // frame drawn: raw cameras back for the game
     if (!g_firstPresentSeen.exchange(true)) {
         InitWaitTimer();
         LogAudioModule();
