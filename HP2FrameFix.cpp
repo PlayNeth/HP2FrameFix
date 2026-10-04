@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.17.7
+// HP2FrameFix.asi  v0.17.8
 // Widescreen section: based on HP2WSFix (MIT, Lovro Pleše) - see that section.
 // HD car reflections section: GPL-3.0 (derived from NFSHP2 HD Reflections by
 // Arctic94 / NFS HD Reflections by Aero_) - see the "HD car reflections" section.
@@ -201,7 +201,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.17.7"
+#define HP2FF_VERSION "0.17.8"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -2565,6 +2565,17 @@ static void __fastcall Ws_Projection(void* view, void*, float fov, float aspect,
             if (x1 - x0 > 8.0f && y1 - y0 > 8.0f) {
                 float a0 = (x1 - x0) / (y1 - y0), r = a1 / a0;
                 bool fix = fabsf(r - 1.0f) > 0.01f;
+                if (!fix && g_cfg.wsLog) {
+                    static DWORD seenU[20]; static int nU = 0;
+                    DWORD key = (DWORD)vw << 16 | (DWORD)vh; bool isNew = true;
+                    for (int k = 0; k < nU; k++) if (seenU[k] == key) isNew = false;
+                    if (isNew && nU < 20) {
+                        seenU[nU++] = key;
+                        const float* fs = reinterpret_cast<const float*>(v + 0x11C);
+                        Logf("widescreen: 3D view %dx%d at %d,%d unchanged: fov %.1f aspect %.3f | vp factors %.3f %.3f\n",
+                             vw, vh, vx, vy, fov, aspect, fs[0], fs[1]);
+                    }
+                }
                 if (fix) {
                     const float d2r = 3.14159265f / 180.0f;
                     float f = 2.0f * atanf(tanf(fov * 0.5f * d2r) * r) / d2r;
@@ -2575,8 +2586,12 @@ static void __fastcall Ws_Projection(void* view, void*, float fov, float aspect,
                     for (int k = 0; k < g_wsProjLogged; k++) if (seen[k] == key) isNew = false;
                     if (g_cfg.wsLog && isNew && g_wsProjLogged < 20) {
                         seen[g_wsProjLogged++] = key;
+                        const float* fs = reinterpret_cast<const float*>(v + 0x11C);
+                        const float* fo = reinterpret_cast<const float*>(v + 0x154);
                         Logf("widescreen: 3D view %dx%d at %d,%d (4:3 screen: %.0fx%.0f): fov %.1f -> %.1f, "
-                             "aspect %.3f -> %.3f\n", vw, vh, vx, vy, x1 - x0, y1 - y0, fov, f, aspect, aspect * r);
+                             "aspect %.3f -> %.3f | vp factors %.3f %.3f offs %.3f %.3f %.3f %.3f\n",
+                             vw, vh, vx, vy, x1 - x0, y1 - y0, fov, f, aspect, aspect * r,
+                             fs[0], fs[1], fo[0], fo[1], fo[2], fo[3]);
                     }
                     fov = f; aspect *= r; g_wsProjFixed++;
                 }
