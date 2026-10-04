@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.17.2
+// HP2FrameFix.asi  v0.17.3
 // Widescreen section: based on HP2WSFix (MIT, Lovro Pleše) - see that section.
 // HD car reflections section: GPL-3.0 (derived from NFSHP2 HD Reflections by
 // Arctic94 / NFS HD Reflections by Aero_) - see the "HD car reflections" section.
@@ -10,6 +10,9 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.17.3: centered text was off to the right: the text measuring code converts
+//    a size with the screen->layout function, which must not subtract the
+//    centering offset there. That call gets a scale-only version.
 // v0.17.2: the minimap sits in the HUD root's parent (<HUD>.GWidget), not in
 //    HudView - that container's side elements go to the edges too.
 // v0.17.1: the minimap (made by code, so never seen loading) goes to the left edge
@@ -193,7 +196,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.17.2"
+#define HP2FF_VERSION "0.17.3"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -2272,6 +2275,7 @@ namespace ws {
         { 0x595304,        "\xD9\x1D\xA8\x2D\x6C\x00", 6 },             // fstp [xscale]
         { fnRectToLayout,  "\x55\x8B\xEC\x83\xEC\x10\xC7\x45", 8 },
         { 0x5954BD,        "\xD8\x0D\xB4\x2D\x6C\x00\xD8\x25\x4C\xBC\x84\x00", 12 }, // fmul invy / fsub ypos
+        { 0x462FDF,        "\xE8\xBC\x24\x13\x00", 5 },                 // call RectToLayout (text size)
         { fnPointToLayout, "\x55\x8B\xEC\x83\xEC\x08\xC7\x45", 8 },
         { fnWidgetRender,  "\x55\x8B\xEC\x83\xEC\x08\x53\x8B\xD9", 9 },
         { 0x59138E,        "\xFF\x52\x48", 3 },                         // this->BeginPaint
@@ -2348,6 +2352,16 @@ static ws::GRect* __cdecl Ws_RectToLayout(ws::GRect* out, const ws::GRect* in) {
     int right  = lrintf((in->w + in->x - ws::xpos) * ws::invx);
     int top    = lrintf((in->y - ws::ypos) * ws::invy);
     int left   = lrintf((in->x - ws::xpos) * ws::invx);
+    out->vt = 0x65E010; out->y = top; out->x = left; out->w = right - left; out->h = bottom - top;
+    return out;
+}
+// Text measuring (0x462C60) converts a size measured from 0,0 with the same
+// function - that must stay a pure scale (no offset), as in the game.
+static ws::GRect* __cdecl Ws_SizeToLayout(ws::GRect* out, const ws::GRect* in) {
+    int bottom = lrintf((in->h + in->y) * ws::invy);
+    int right  = lrintf((in->w + in->x) * ws::invx);
+    int top    = lrintf(in->y * ws::invy);
+    int left   = lrintf(in->x * ws::invx);
     out->vt = 0x65E010; out->y = top; out->x = left; out->w = right - left; out->h = bottom - top;
     return out;
 }
@@ -2639,6 +2653,7 @@ static void InstallWidescreen() {
     if (g_cfg.wsCenterUI) {
         ok &= WsJmp(ws::fnFESetup, (void*)&Ws_FESetup);
         ok &= WsJmp(ws::fnRectToLayout, (void*)&Ws_RectToLayout);
+        ok &= PatchCallRel32(0x462FDF, (void*)&Ws_SizeToLayout);   // text measuring
         ok &= WsJmp(ws::fnPointToLayout, (void*)&Ws_PointToLayout);
         ok &= PatchCallRel32(ws::callReadBounds, (void*)&Ws_ReadBounds);
         ok &= WsJmp(ws::fnWidgetRender, (void*)&Ws_WidgetRender);
