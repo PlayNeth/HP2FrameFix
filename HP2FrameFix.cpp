@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.15-interp (test build)
+// HP2FrameFix.asi  v0.15.3
 // Frame pacing, game clock fix, EAX-on-startup fix and loading speed-up
 // for Need for Speed: Hot Pursuit 2 (PC)
 //
@@ -7,13 +7,18 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.15.3: fixed the driver sometimes repeating the gear-shift animation forever.
+//    The clip selector (0x42E6B0) ends a shift when the anim's "looped" flag is
+//    set; with fractional animation advances a later small advance could clear
+//    the flag before the selector looked. The flag is now a latch: set when a
+//    clip wraps, cleared only when the selector starts a new clip.
 // v0.15.2-interp: a camera whose view direction turns > 45 deg (or rolls, or
 //    whose fov jumps) within one step counts as a cut - look back on cameras
 //    that flip the same camera object was blended through the car.
 // v0.15.1-interp: a frame whose camera can't be blended (look back / camera
 //    switch / jump) now draws the cars un-blended too - they were a step away
 //    from the camera for a frame, which flickered when looking back.
-// v0.15-interp (TEST BUILD, based on v0.13.2):
+// v0.15 (based on v0.13.2):
 //  - Interpolation: racing cars and the camera are drawn between the game's
 //    60 Hz physics steps, so motion is smooth at any frame rate above 60.
 //    After every WorldStep (0x4D0370) the physics bodies of the cars drawn last
@@ -153,7 +158,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.15.2-interp"
+#define HP2FF_VERSION "0.15.3"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -194,6 +199,13 @@ namespace hp2 {
         { 0x4D00A9,       "\x8A\x5D\x08\xB1\x01\x22\xD9", 7 },         // bl = step & 1
         { 0x4D0217,       "\xE8\x34\xA6\xFF\xFF", 5 },                 // call 0x4CA850
         { 0x4D021C,       "\x84\xDB\x74\x35", 4 },                      // test bl,bl / je skip
+        { 0x42E6FA,       "\x8A\x47\x3E", 3 },                           // selector reads looped (+0x34+0xA)
+        { 0x42E761,       "\xE8\xDA\x3F\xFD\xFF", 5 },                 // selector PlayAnim calls (6)
+        { 0x42E775,       "\xE8\xC6\x3F\xFD\xFF", 5 },
+        { 0x42E795,       "\xE8\xA6\x3F\xFD\xFF", 5 },
+        { 0x42E7A9,       "\xE8\x92\x3F\xFD\xFF", 5 },
+        { 0x42E7BD,       "\xE8\x7E\x3F\xFD\xFF", 5 },
+        { 0x42E83A,       "\xE8\x01\x3F\xFD\xFF", 5 },
         { 0x406FB0,       "\x8B\x49\x5C\x85\xC9\x74\x05", 7 },         // ActorList::UpdateAll wrapper
         { 0x41D7E1,       "\x8B\xD1\xD1\xFA\x89\x15\xFC\x33\x6D\x00\xD1\xF9", 12 }, // props: half steps
         { 0x41D80B,       "\xD8\x0D\x94\xD6\x65\x00", 6 },            // particles: fmul [0.5]
@@ -1003,7 +1015,6 @@ static void AnimDiagFlush(double seconds) {
 static bool __fastcall Hook_AnimAdvance(AnimChannelSet* cs, void*) {
     if (cs->paused) {
         cs->elapsed = 0;
-        if (g_cfg.fixDriverShiftAnim) cs->looped = 0;
         return false;
     }
     const int counter = *reinterpret_cast<volatile int*>(hp2::pStepCounter);
@@ -1037,8 +1048,7 @@ static bool __fastcall Hook_AnimAdvance(AnimChannelSet* cs, void*) {
 
     AnimDiagRecord(cs, steps);
     if (!(steps > 1e-6)) {
-        cs->elapsed = 0;
-        if (g_cfg.fixDriverShiftAnim) cs->looped = 0;   // nothing ended during this call
+        cs->elapsed = 0;                                 // nothing advanced: flag left as is
         return false;
     }
 
@@ -1056,8 +1066,29 @@ static bool __fastcall Hook_AnimAdvance(AnimChannelSet* cs, void*) {
         ch.time = (float)((double)ch.time + steps * (double)ch.rate);
         if (ch.time > ch.length) { ch.time = 0.0f; looped = true; }
     }
-    cs->looped = looped ? 1 : 0;
+    if (g_cfg.fixDriverShiftAnim) {
+        // Latch: once a clip wraps the flag stays set until the driver's clip
+        // selector starts a new clip (Hook_SelectorPlayAnim). With fractional
+        // advances a later small advance used to clear it before the selector
+        // looked, so the shift clip never "ended" and replayed forever.
+        if (looped) cs->looped = 1;
+    } else {
+        cs->looped = looped ? 1 : 0;
+    }
     return looped;
+}
+
+// The driver's clip selector (0x42E6B0) starts clips through these six calls
+// to Actor::PlayAnim (0x402740, thiscall(id, param), ret 8). Clearing the
+// looped latch here means a new shift clip can't inherit an old "ended".
+namespace hp2 {
+    const DWORD fnPlayAnim = 0x402740;
+    const DWORD callSelectorPlayAnim[6] = { 0x42E761, 0x42E775, 0x42E795, 0x42E7A9, 0x42E7BD, 0x42E83A };
+}
+typedef void (__fastcall *PlayAnim_t)(void* actor, void* edx, DWORD id, DWORD param);
+static void __fastcall Hook_SelectorPlayAnim(void* actor, void*, DWORD id, DWORD param) {
+    reinterpret_cast<AnimChannelSet*>(reinterpret_cast<BYTE*>(actor) + 0x34)->looped = 0;
+    reinterpret_cast<PlayAnim_t>(hp2::fnPlayAnim)(actor, nullptr, id, param);
 }
 
 static void InstallAnimClockPatch() {
@@ -1067,6 +1098,8 @@ static void InstallAnimClockPatch() {
     DWORD rel = reinterpret_cast<DWORD>(&Hook_AnimAdvance) - (hp2::fnAnimAdvance + 5);
     memcpy(jmp + 1, &rel, 4);
     bool ok = PatchBytes(hp2::fnAnimAdvance, jmp, sizeof(jmp));
+    if (ok && g_cfg.fixDriverShiftAnim)
+        for (DWORD at : hp2::callSelectorPlayAnim) ok = ok && PatchCallRel32(at, (void*)&Hook_SelectorPlayAnim);
     Logf("animation clock: %s (fractional=%d, shiftFix=%d)\n", ok ? "replaced" : "patch FAILED",
          g_cfg.smoothSlowMotionAnims, g_cfg.fixDriverShiftAnim);
 }
