@@ -7,6 +7,9 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.15.1-interp: a frame whose camera can't be blended (look back / camera
+//    switch / jump) now draws the cars un-blended too - they were a step away
+//    from the camera for a frame, which flickered when looking back.
 // v0.15-interp (TEST BUILD, based on v0.13.2):
 //  - Interpolation: racing cars and the camera are drawn between the game's
 //    60 Hz physics steps, so motion is smooth at any frame rate above 60.
@@ -147,7 +150,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.15-interp"
+#define HP2FF_VERSION "0.15.1-interp"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -1234,6 +1237,10 @@ struct IpVeh { DWORD veh, car; unsigned long long seen; };
 static IpVeh  g_ipVehs[kIpCars]; static int g_ipNVehs = 0;
 static DWORD  g_ipOwners[kIpCams]; static int g_ipNOwners = 0;
 static DWORD  g_ipPendingCar = 0, g_ipPendingVeh = 0;
+// A view built this frame with an un-blended camera (cut / switch / mismatch):
+// draw the cars un-blended too, or they'd sit a step away from the camera.
+static unsigned long long g_ipCutFrame = ~0ull;
+static unsigned long g_ipCutFrames = 0;
 
 // statistics
 static unsigned long g_ipFrames = 0, g_ipFramesBlended = 0, g_ipAhead = 0, g_ipBehind = 0,
@@ -1495,7 +1502,8 @@ static void __fastcall Hook_CarSetOwner(void* car, void*, void* veh) {
 }
 
 static void __fastcall Hook_CarSetXform(void* car, void*, void* view, const float* pos, const float* rot) {
-    if (g_cfg.interpolate && reinterpret_cast<DWORD>(car) == g_ipPendingCar && g_ipPendingVeh) {
+    if (g_cfg.interpolate && g_ipCutFrame == g_presentCount) { g_ipCarsPass++; }
+    else if (g_cfg.interpolate && reinterpret_cast<DWORD>(car) == g_ipPendingCar && g_ipPendingVeh) {
         const IpFrame& f = FrameBlend();
         const IpCar* a = f.ok ? FindCar(f.A, g_ipPendingVeh) : nullptr;
         const IpCar* b = f.ok ? FindCar(f.B, g_ipPendingVeh) : nullptr;
@@ -1521,6 +1529,10 @@ static void __fastcall Hook_CarSetXform(void* car, void*, void* view, const floa
     reinterpret_cast<CarSetXform_t>(hp2::fnCarSetXform)(car, nullptr, view, pos, rot);
 }
 
+static void MarkCutFrame() {
+    if (g_ipCutFrame != g_presentCount) { g_ipCutFrame = g_presentCount; g_ipCutFrames++; }
+}
+
 static DWORD __fastcall Hook_BuildView(void* ownerP, void*, DWORD a, DWORD b, DWORD c) {
     BuildView_t orig = reinterpret_cast<BuildView_t>(hp2::fnBuildView);
     DWORD owner = reinterpret_cast<DWORD>(ownerP);
@@ -1538,13 +1550,13 @@ static DWORD __fastcall Hook_BuildView(void* ownerP, void*, DWORD a, DWORD b, DW
         if (ca && cb && cn && cam && ReadCam(cam, cur)) {
             if (ca->cam != cb->cam || cb->cam != cam || cn->cam != cam ||
                 ca->activeId != cb->activeId || cb->activeId != id) {
-                g_ipCamCut++;                                   // camera switched between the steps
+                g_ipCamCut++; MarkCutFrame();                   // camera switched between the steps
             } else if (!NearlyEqual(cur, cn->f, 10)) {
-                g_ipCamMismatch++;                              // moved outside a step
+                g_ipCamMismatch++; MarkCutFrame();              // moved outside a step
             } else {
                 float dx = cb->f[0]-ca->f[0], dy = cb->f[1]-ca->f[1], dz = cb->f[2]-ca->f[2];
                 if (dx*dx + dy*dy + dz*dz > g_cfg.maxStepDistance * g_cfg.maxStepDistance) {
-                    g_ipCamCut++;
+                    g_ipCamCut++; MarkCutFrame();
                 } else {
                     float bl[10];
                     for (int i = 0; i < 10; i++) bl[i] = ca->f[i] + (cb->f[i] - ca->f[i]) * f.t;
@@ -1585,15 +1597,15 @@ static void InstallInterpolation() {
 static void LogInterpStats() {
     if (!g_cfg.interpolate || !g_knownExe) return;
     Logf("  interp: steps=%lu frames=%lu blended=%lu (avg t %.2f) ahead=%lu behind=%lu | cars blended=%lu "
-         "passed=%lu (mismatch %lu, jump %lu) | camera blended=%lu cuts=%lu mismatch=%lu | resets=%lu "
+         "passed=%lu (mismatch %lu, jump %lu) | camera blended=%lu cuts=%lu mismatch=%lu (cut frames %lu) | resets=%lu "
          "clock snaps=%lu | tracked cars=%d views=%d | other car draws: listB=%lu sim-placed=%lu\n",
          g_ipSteps, g_ipFrames, g_ipFramesBlended, g_ipFramesBlended ? g_ipAlphaSum / g_ipFramesBlended : 0.0,
          g_ipAhead, g_ipBehind, g_ipCarsBlended, g_ipCarsPass, g_ipCarMismatch, g_ipCarJump,
-         g_ipCamsBlended, g_ipCamCut, g_ipCamMismatch, g_ipResets, g_ipClockSnaps, g_ipNVehs,
+         g_ipCamsBlended, g_ipCamCut, g_ipCamMismatch, g_ipCutFrames, g_ipResets, g_ipClockSnaps, g_ipNVehs,
          g_ipNOwners, g_ipDrawListB, g_ipDrawSimCar);
     g_ipSteps = g_ipFrames = g_ipFramesBlended = g_ipAhead = g_ipBehind = g_ipCarsBlended =
         g_ipCarsPass = g_ipCarMismatch = g_ipCarJump = g_ipCamsBlended = g_ipCamCut =
-        g_ipCamMismatch = g_ipResets = g_ipClockSnaps = g_ipDrawListB = g_ipDrawSimCar = 0;
+        g_ipCamMismatch = g_ipResets = g_ipClockSnaps = g_ipDrawListB = g_ipDrawSimCar = g_ipCutFrames = 0;
     g_ipAlphaSum = 0;
 }
 
