@@ -7,6 +7,16 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// Changes from v0.13.1:
+//  - Fixed the game speeding up when the frame cap can't be reached (e.g. a
+//    480 cap running at ~270 fps). Every missed deadline re-anchored the
+//    limiter, and every re-anchor let the tick scheduler fire the next tick as
+//    early as half a tick after the previous one - with re-anchors every few
+//    ms the 120 Hz sim ran up to ~2x. Now: re-locking never fires a tick
+//    earlier than one full tick after the last; free-running ticks keep their
+//    cadence across schedule changes; and when the limiter keeps missing its
+//    deadlines the ticks free-run until frames are on time again (2 s).
+//
 // Changes from v0.13:
 //  - Fixed knocked props flickering: the prop sync (0x433900) moves each prop
 //    onto a pending list (0x444F20); the renderer only draws objects that are
@@ -122,7 +132,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.13.1"
+#define HP2FF_VERSION "0.13.2"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -723,12 +733,17 @@ static DWORD WINAPI TickSchedulerThread(LPVOID) {
         curGen = g_gridGen; ga = g_gridAnchor; gp = g_gridPeriod; tpf = g_gridTpf;
         LeaveCriticalSection(&g_gridLock);
 
+        bool wantLock = gp > 0 && tpf > 0;
+        bool freeRunning = base != 0 && num == freq && den == rate;
+        if (curGen != gen && !wantLock && freeRunning) gen = curGen;   // keep cadence
         if (curGen != gen || base == 0) {
             gen = curGen;
-            // Never fire two ticks closer than half a tick apart.
-            LONGLONG earliest = lastFire ? lastFire + tickLen / 2 : now;
+            // Never fire two ticks closer than one tick apart: a schedule change
+            // may delay the next tick (once), never bring it forward - otherwise
+            // frequent re-anchors would speed the game up.
+            LONGLONG earliest = lastFire ? lastFire + tickLen : now;
             if (earliest < now - tickLen) earliest = now - tickLen;
-            if (gp > 0 && tpf > 0) {
+            if (wantLock) {
                 // Phase-lock: tpf ticks per frame, offset into each tick slot.
                 num = gp; den = tpf;
                 base = ga + (LONGLONG)((double)g_cfg.tickPhase * (double)gp / tpf);
@@ -1108,6 +1123,8 @@ static void SampleTicksPerFrame(bool countIt) {
 static std::atomic<bool> g_firstPresentSeen{false};
 static LONGLONG g_lastPresentQpc = 0;
 static LONGLONG g_nextDeadline   = 0;
+static LONGLONG g_lastReanchor   = 0;
+static bool     g_gridUnstable   = false;
 static unsigned long long g_presentCount = 0, g_intervalCount = 0;
 static double g_minDelta = 1e9, g_maxDelta = 0.0, g_sumDelta = 0.0;
 
@@ -1169,9 +1186,20 @@ static HRESULT STDMETHODCALLTYPE Hook_Present(
             }
             if (!g_nextDeadline || now - g_nextDeadline > period) {
                 g_nextDeadline = now + period;
-                PublishGrid(g_nextDeadline, period);   // new frame schedule: re-lock ticks
+                // Missing the cap repeatedly: don't chase the frames with the
+                // ticks, let them free-run until frames are on time again.
+                if (g_lastReanchor && now - g_lastReanchor < g_qpcFreq.QuadPart) {
+                    if (!g_gridUnstable) { g_gridUnstable = true; PublishGrid(0, 0); }
+                } else if (!g_gridUnstable) {
+                    PublishGrid(g_nextDeadline, period);   // new frame schedule: re-lock ticks
+                }
+                g_lastReanchor = now;
             } else {
                 g_nextDeadline += period;
+                if (g_gridUnstable && now - g_lastReanchor > 2 * g_qpcFreq.QuadPart) {
+                    g_gridUnstable = false;                  // steady again: re-lock
+                    PublishGrid(g_nextDeadline, period);
+                }
             }
         } else {
             if (g_nextDeadline) PublishGrid(0, 0);   // limiter paused: free-running ticks
