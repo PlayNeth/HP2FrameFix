@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.17
+// HP2FrameFix.asi  v0.17.1
 // Widescreen section: based on HP2WSFix (MIT, Lovro Pleše) - see that section.
 // HD car reflections section: GPL-3.0 (derived from NFSHP2 HD Reflections by
 // Arctic94 / NFS HD Reflections by Aero_) - see the "HD car reflections" section.
@@ -10,6 +10,8 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.17.1: the minimap (made by code, so never seen loading) goes to the left edge
+//    like the rest of the HUD; wsLog=2 logs every widget drawn.
 // v0.17: widescreen support (widescreen and ws* keys), reworked from HP2WSFix:
 //    centered undistorted menus/HUD at any aspect, full-screen backgrounds
 //    filled, HUD side elements at the screen edges, Hor+ 3D FOV, menus at the
@@ -189,7 +191,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.17"
+#define HP2FF_VERSION "0.17.1"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -400,7 +402,7 @@ static const char kWsBlock[] =
     "wsMovies=1\n"
     "; list every display mode in the options (the game hides some)\n"
     "wsUnlockResolutions=1\n"
-    "; log what the widescreen code adjusts\n"
+    "; log what the widescreen code adjusts (2 = also every widget drawn, for diagnostics)\n"
     "wsLog=1\n";
 
 static void LoadConfig() {
@@ -2393,7 +2395,7 @@ static DWORD __fastcall Ws_ReadBounds(void* reader, void*, const char* key, void
                                         "GImageBar", "HudStaticArt" };
     for (const char* c : kImg) if (!strcmp(cls, c)) e->flags |= kWsImage;
     if (strstr(cls, "Actor")) e->flags |= kWsActor;
-    if ((e->flags & kWsHudView) && g_cfg.wsLog && g_wsLogLines < 300) {
+    if ((e->flags & kWsHudView) && g_cfg.wsLog && g_wsLogLines < 900) {
         g_wsLogLines++;
         const ws::GRect* rc = static_cast<const ws::GRect*>(rect);
         Logf("widescreen: HUD root %s %d,%d %dx%d\n", name, rc->x, rc->y, rc->w, rc->h);
@@ -2420,11 +2422,54 @@ static void WsGlobalRect(DWORD w, int& x, int& y, int& rw, int& rh) {
 enum WsMode { kWsNone, kWsLeft, kWsRight, kWsStretchX, kWsStretch, kWsFill };
 static const char* const kWsModeName[] = { "none", "left edge", "right edge", "stretch width", "stretch", "fill" };
 
+// widgets the GUI draws that were never seen loading (made by code): logged once
+static DWORD g_wsSeenNoName[2][64]; static int g_wsSeenNoNameN[2] = {};
+static bool WsOnce(const WsWidget* e, DWORD w, int which) {   // which: 0 = draw line, 1 = decision
+    BYTE bit = which ? 16 : kWsLogged;
+    if (e) { if (e->flags & bit) return false; const_cast<WsWidget*>(e)->flags |= bit; return true; }
+    for (int i = 0; i < g_wsSeenNoNameN[which]; i++) if (g_wsSeenNoName[which][i] == w) return false;
+    if (g_wsSeenNoNameN[which] < 64) g_wsSeenNoName[which][g_wsSeenNoNameN[which]++] = w;
+    return true;
+}
+
 static WsMode WsClassify(DWORD w) {
     const WsWidget* e = WsFind(w);
-    if (!e) return kWsNone;
     WsMode m = kWsNone;
-    int x, y, rw, rh;
+    int x = 0, y = 0, rw = 0, rh = 0;
+    if (g_cfg.wsLog >= 2 && g_wsLogLines < 900) {      // diagnostics: every widget drawn, once
+        if (WsOnce(e, w, 0)) {
+            WsGlobalRect(w, x, y, rw, rh);
+            const WsWidget* p = WsFind(*reinterpret_cast<DWORD*>(w + 0x38));
+            g_wsLogLines++;
+            Logf("widescreen: draw %s (vt %06lX) at %d,%d %dx%d, parent %s, %d children\n",
+                 e ? e->name : "(made by code)", *reinterpret_cast<DWORD*>(w) & 0xFFFFFF, x, y, rw, rh,
+                 p ? p->name : "-", *reinterpret_cast<int*>(w + 0x10));
+        }
+    }
+    // HUD: elements on the HUD's left/right third go to the screen edges. Only
+    // the parent has to be known (the minimap is made by code, not loaded).
+    if (g_cfg.wsHudToEdges && g_wsOffX > 0.5f) {
+        DWORD pw = *reinterpret_cast<DWORD*>(w + 0x38);
+        const WsWidget* p = WsFind(pw);
+        if (p && (p->flags & kWsHudView) && !(e && (e->flags & kWsImage) && *reinterpret_cast<int*>(w + 0x6C) >=
+                                                  *reinterpret_cast<int*>(pw + 0x6C) - 4)) {
+            int px = *reinterpret_cast<int*>(w + 0x68), pwid = *reinterpret_cast<int*>(pw + 0x6C);
+            int ew = *reinterpret_cast<int*>(w + 0x6C);
+            if (pwid > 0 && ew < pwid * 6 / 10) {
+                int cx2 = 2 * px + ew;                        // 2 * center
+                if (cx2 * 3 < 2 * pwid) m = kWsLeft;
+                else if (cx2 * 3 > 4 * pwid) m = kWsRight;
+            }
+            if (g_cfg.wsLog && g_wsLogLines < 900 && WsOnce(e, w, 1)) {
+                g_wsLogLines++;
+                Logf("widescreen: HUD %s at %d,%d %dx%d -> %s\n", e ? e->name : "(made by code)", px,
+                     *reinterpret_cast<int*>(w + 0x64), ew, *reinterpret_cast<int*>(w + 0x70),
+                     m == kWsLeft ? "left edge" : m == kWsRight ? "right edge" : "stays");
+            }
+            return m;
+        }
+    }
+    if (!e) return kWsNone;
     // full-screen background images (leaves): fill the screen
     if ((e->flags & (kWsImage | kWsActor)) && g_cfg.wsBackgrounds && *reinterpret_cast<int*>(w + 0x10) == 0) {
         WsGlobalRect(w, x, y, rw, rh);
@@ -2437,29 +2482,8 @@ static WsMode WsClassify(DWORD w) {
         else if (fullW && rh < g_wsVH - 2 && g_wsOffX > 0.5f && (e->flags & kWsImage))
             m = kWsStretchX;                                  // bars / strips
     }
-    // HUD: elements on the HUD's left/right third go to the screen edges
-    if (m == kWsNone && g_cfg.wsHudToEdges && g_wsOffX > 0.5f) {
-        const WsWidget* p = WsFind(*reinterpret_cast<DWORD*>(w + 0x38));
-        if (p && (p->flags & kWsHudView)) {
-            DWORD pw = *reinterpret_cast<DWORD*>(w + 0x38);
-            int px = *reinterpret_cast<int*>(w + 0x68), pwid = *reinterpret_cast<int*>(pw + 0x6C);
-            int ew = *reinterpret_cast<int*>(w + 0x6C);
-            if (pwid > 0 && ew < pwid * 6 / 10) {
-                int cx2 = 2 * px + ew;                        // 2 * center
-                if (cx2 * 3 < 2 * pwid) m = kWsLeft;
-                else if (cx2 * 3 > 4 * pwid) m = kWsRight;
-            }
-            if (g_cfg.wsLog && !(e->flags & kWsLogged) && g_wsLogLines < 300) {
-                const_cast<WsWidget*>(e)->flags |= kWsLogged; g_wsLogLines++;
-                Logf("widescreen: HUD %s at %d,%d %dx%d -> %s\n", e->name, px,
-                     *reinterpret_cast<int*>(w + 0x64), ew, *reinterpret_cast<int*>(w + 0x70),
-                     m == kWsLeft ? "left edge" : m == kWsRight ? "right edge" : "stays");
-            }
-            return m;
-        }
-    }
-    if (m != kWsNone && g_cfg.wsLog && !(e->flags & kWsLogged) && g_wsLogLines < 300) {
-        const_cast<WsWidget*>(e)->flags |= kWsLogged; g_wsLogLines++;
+    if (m != kWsNone && g_cfg.wsLog && g_wsLogLines < 900 && WsOnce(e, w, 1)) {
+        g_wsLogLines++;
         Logf("widescreen: %s %d,%d %dx%d -> %s\n", e->name, x, y, rw, rh, kWsModeName[m]);
     }
     return m;
