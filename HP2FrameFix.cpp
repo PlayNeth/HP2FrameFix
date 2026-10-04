@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.16.1
+// HP2FrameFix.asi  v0.16.2
 // HD car reflections section: GPL-3.0 (derived from NFSHP2 HD Reflections by
 // Arctic94 / NFS HD Reflections by Aero_) - see the "HD car reflections" section.
 // Frame pacing, game clock fix, EAX-on-startup fix and loading speed-up
@@ -9,6 +9,9 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.16.2: v0.16.1 also swapped the body rotation during the cubemap update;
+//    the game caches the car's draw transform there, so the player car was
+//    drawn unblended (cars mismatch ~1 per frame). Removed; camera part kept.
 // v0.16.1: sun glints / reflections on the car no longer wobble with interpolation.
 //    The cubemap update (0x53E380) aims the sphere map at the camera eye (read
 //    through the view, 0x40CFD0) and, in one mode, along the body rotation
@@ -176,7 +179,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.16.1"
+#define HP2FF_VERSION "0.16.2"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -1767,21 +1770,16 @@ static void __fastcall Hook_ReflUpdate(void* mgr, void*, void* view, const float
                 float bp[3], br[9];
                 ToRenderSpace(x, bp, br);
                 g_ipReflBlended++;
-                // The update orients the sphere map from the camera eye (read
-                // through the view) or, in one mode, from the body rotation at
-                // body+0x2B4. Show it the blended ones for the call.
-                DWORD body = 0, cam = 0;
-                float rawRot[9], rawCam[10];
-                SafeRead(n->cars[i].veh + 0x6E8, &body);
-                bool bodyOk = body && !IsBadWritePtr(reinterpret_cast<void*>(body + 0x2B4), 36) &&
-                              NearlyEqual(reinterpret_cast<const float*>(body + 0x2A8), n->cars[i].x, 12);
-                if (bodyOk) { memcpy(rawRot, reinterpret_cast<void*>(body + 0x2B4), 36);
-                              memcpy(reinterpret_cast<void*>(body + 0x2B4), x + 3, 36); }
+                // The update orients the sphere map toward the camera eye, read
+                // through the view (0x40CFD0) - show it the blended camera.
+                // (Don't touch the body: the game caches the car's draw
+                // transform from it during this call.)
+                DWORD cam = 0;
+                float rawCam[10];
                 const IpViewCam* vc = FindViewCam(reinterpret_cast<DWORD>(view));
                 if (vc && ReadCam(vc->cam, rawCam)) { cam = vc->cam; WriteCam(cam, vc->f); g_ipReflCamBlended++; }
                 orig(mgr, nullptr, view, bp);
                 if (cam) WriteCam(cam, rawCam);
-                if (bodyOk) memcpy(reinterpret_cast<void*>(body + 0x2B4), rawRot, 36);
                 return;
             }
         }
