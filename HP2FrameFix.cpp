@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.12
+// HP2FrameFix.asi  v0.13.1
 // Frame pacing, game clock fix, EAX-on-startup fix and loading speed-up
 // for Need for Speed: Hot Pursuit 2 (PC)
 //
@@ -7,9 +7,26 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// Changes from v0.13:
+//  - Fixed knocked props flickering: the prop sync (0x433900) moves each prop
+//    onto a pending list (0x444F20); the renderer only draws objects that are
+//    in a grid cell, and the game re-files the pending list (0x444F80) right
+//    after its own sync. The even-step sync now does the same.
+//
+// Changes from v0.12:
+//  - smoothProps now targets the real knockable props. When hit, a prop gets a
+//    rigid body from a 40-entry pool (0x6E27A0). Its rendered transform is
+//    synced from the body (0x433900) only on odd physics steps, and bodies in
+//    the simplified integrator (0x444440, dt = 1/30) also only step on odd
+//    steps. The sync loop (0x4D8850) now also runs on even steps, and the
+//    simplified integrator runs every step with dt = 1/60. Collisions keep
+//    their original odd-step rate.
+//  - The v0.12 patch (0x41D760) turned out to be the particle/debris pool
+//    (smoke, sparks, crash debris); it is kept as smoothParticles.
+//
 // Changes from v0.11:
-//  - smoothProps: knockable trackside props (signs, cones... the 450-entry
-//    object pool at 0x6D42B0) integrate their motion in 0x41D760 using
+//  - smoothParticles (was mislabelled smoothProps): the particle/debris pool
+//    at 0x6D42B0 integrates its motion in 0x41D760 using
 //    "half steps" (stepCounter >> 1), i.e. 30 Hz. The two halvings are removed
 //    and the 0.5 scale becomes 0.25, so they move every physics step at the
 //    same speed. Their collision/limit pass (0x41D020) keeps its original rate.
@@ -105,7 +122,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.12"
+#define HP2FF_VERSION "0.13.1"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -148,7 +165,17 @@ namespace hp2 {
         { 0x4D021C,       "\x84\xDB\x74\x35", 4 },                      // test bl,bl / je skip
         { 0x406FB0,       "\x8B\x49\x5C\x85\xC9\x74\x05", 7 },         // ActorList::UpdateAll wrapper
         { 0x41D7E1,       "\x8B\xD1\xD1\xFA\x89\x15\xFC\x33\x6D\x00\xD1\xF9", 12 }, // props: half steps
-        { 0x41D80B,       "\xD8\x0D\x94\xD6\x65\x00", 6 },            // props: fmul [0.5]
+        { 0x41D80B,       "\xD8\x0D\x94\xD6\x65\x00", 6 },            // particles: fmul [0.5]
+        { 0x4D53B8,       "\x85\xDB\x74\x09", 4 },                      // simple integrator odd-only gate
+        { 0x4D8850,       "\xA1\xA8\x9A\x6E\x00\x57\x33\xFF", 8 },     // sync flying props loop
+        { 0x444F80,       "\x55\x8B\xEC\x83\xEC\x18\x56\x8B\x35\xC8\x1A\x70\x00", 13 }, // re-file pending objects
+        { 0x444440,       "\x55\x8B\xEC\x83\xEC\x48\x53\x8B\x5D\x08", 10 }, // simple integrator
+        { 0x444495,       "\xD8\x0D\x90\xD6\x65\x00", 6 },            // dt 1/30 sites (6)
+        { 0x4444A9,       "\xD8\x0D\x90\xD6\x65\x00", 6 },
+        { 0x4444B6,       "\xD8\x0D\x90\xD6\x65\x00", 6 },
+        { 0x4444DE,       "\xD8\x0D\x90\xD6\x65\x00", 6 },
+        { 0x4444F9,       "\xD8\x0D\x90\xD6\x65\x00", 6 },
+        { 0x444517,       "\xD8\x0D\x90\xD6\x65\x00", 6 },
     };
 }
 
@@ -168,6 +195,7 @@ struct Config {
     int   animDiag             = 0;
     int   smoothCharacterAnims = 1;
     int   smoothProps          = 1;
+    int   smoothParticles      = 1;
     float tickPhase            = 0.75f; // where ticks sit inside each tick slot after a frame deadline
     int   fixEAXOnStartup      = 1;
     int   eaxFixStableFrames   = 90;    // frames the bad state must persist first
@@ -237,8 +265,10 @@ static void LoadConfig() {
                 "fixDriverShiftAnim=1\n"
                 "; update characters (drivers, cops, dog) every physics step instead of every other\n"
                 "smoothCharacterAnims=1\n"
-                "; move knockable props (signs, cones) every physics step instead of every other\n"
+                "; move knocked props (signs, meters, cones) every physics step instead of every other\n"
                 "smoothProps=1\n"
+                "; move particles/debris (smoke, sparks) every physics step\n"
+                "smoothParticles=1\n"
                 "; log per-character animation update rates (diagnostics)\n"
                 "animDiag=0\n"
                 "; --- EAX: re-apply saved EAX mode after startup ---\n"
@@ -273,6 +303,7 @@ static void LoadConfig() {
         else if (!_stricmp(key, "animDiag"))             g_cfg.animDiag = atoi(val);
         else if (!_stricmp(key, "smoothCharacterAnims")) g_cfg.smoothCharacterAnims = atoi(val);
         else if (!_stricmp(key, "smoothProps"))          g_cfg.smoothProps = atoi(val);
+        else if (!_stricmp(key, "smoothParticles"))      g_cfg.smoothParticles = atoi(val);
         else if (!_stricmp(key, "tickPhase"))            g_cfg.tickPhase = (float)atof(val);
         else if (!_stricmp(key, "fixEAXOnStartup"))      g_cfg.fixEAXOnStartup = atoi(val);
         else if (!_stricmp(key, "eaxFixStableFrames"))   g_cfg.eaxFixStableFrames = atoi(val);
@@ -316,9 +347,9 @@ static void OpenLog() {
          g_cfg.enableLimiter, g_cfg.targetFPS, g_cfg.passthrough,
          g_cfg.raiseTimerResolution, g_cfg.hiResGameTimers);
     Logf("preciseGameTicks=%d tickPhase=%.2f smoothDriverSteering=%d smoothSlowMotionAnims=%d "
-         "fixDriverShiftAnim=%d animDiag=%d smoothCharacterAnims=%d smoothProps=%d\n", g_cfg.preciseGameTicks, g_cfg.tickPhase,
+         "fixDriverShiftAnim=%d animDiag=%d smoothCharacterAnims=%d smoothProps=%d smoothParticles=%d\n", g_cfg.preciseGameTicks, g_cfg.tickPhase,
          g_cfg.smoothDriverSteering, g_cfg.smoothSlowMotionAnims, g_cfg.fixDriverShiftAnim,
-         g_cfg.animDiag, g_cfg.smoothCharacterAnims, g_cfg.smoothProps);
+         g_cfg.animDiag, g_cfg.smoothCharacterAnims, g_cfg.smoothProps, g_cfg.smoothParticles);
     Logf("fixEAX=%d speedUpLoading=%d loadScreenRenderMs=%d limiterDuringLoading=%d\n",
          g_cfg.fixEAXOnStartup, g_cfg.speedUpLoading, g_cfg.loadScreenRenderMs,
          g_cfg.limiterDuringLoading);
@@ -978,6 +1009,7 @@ namespace hp2 {
     const DWORD fnWorldStepMid   = 0x4CA850;   // ignores ecx, no stack args
     const DWORD fnActorsUpdate   = 0x406FB0;   // thiscall(ActorManager*): UpdateAll
 }
+static bool g_propsSyncEveryStep = false;   // set by InstallPropsPatch
 typedef void (__fastcall *ThisNoArgs_t)(void* self, void* edx);
 static std::atomic<unsigned long> g_extraActorUpdates{0};
 
@@ -987,29 +1019,51 @@ static void __fastcall Hook_WorldStepMid(void* self, void*) {
     // when (step & 1) != 0. Fill in the even steps.
     int step = *reinterpret_cast<volatile int*>(hp2::pStepCounter);
     if (step & 1) return;
+    if (g_propsSyncEveryStep)
+    {
+        reinterpret_cast<void (*)()>(0x4D8850)();     // sync flying props' transforms
+        reinterpret_cast<void (*)()>(0x444F80)();     // re-file them into grid cells (drawn per cell)
+    }
+    if (!g_cfg.smoothCharacterAnims) return;
     DWORD app = 0, mgr = 0;
     if (!SafeRead(hp2::pApp, &app) || !app || !SafeRead(app + 0x30, &mgr) || !mgr) return;
     reinterpret_cast<ThisNoArgs_t>(hp2::fnActorsUpdate)(reinterpret_cast<void*>(mgr), nullptr);
     g_extraActorUpdates++;
 }
 
-// Knockable props: 0x41D760 integrates with h = (counter>>1) - last, scaled by 0.5.
+// Particles/debris: 0x41D760 integrates with h = (counter>>1) - last, scaled by 0.5.
 static float g_propStepScale = 0.25f;
 
-static void InstallPropsPatch() {
-    if (!g_knownExe || !g_cfg.smoothProps) return;
+static void InstallParticlesPatch() {
+    if (!g_knownExe || !g_cfg.smoothParticles) return;
     const BYTE nop2[2] = { 0x90, 0x90 };
     DWORD scaleAddr = reinterpret_cast<DWORD>(&g_propStepScale);
     bool ok = PatchBytes(0x41D7E3, nop2, 2) &&          // sar edx,1 (first-run init)
               PatchBytes(0x41D7EB, nop2, 2) &&          // sar ecx,1
               PatchBytes(0x41D80D, &scaleAddr, 4);      // fmul [0.5] -> [0.25]
-    Logf("props: %s\n", ok ? "move every physics step (60 Hz)" : "patch FAILED");
+    Logf("particles: %s\n", ok ? "move every physics step (60 Hz)" : "patch FAILED");
+}
+
+// Knocked props: rigid-body pool 0x6E27A0.
+static float g_simpleBodyDt = 1.0f / 60.0f;   // simplified integrator was 1/30 per odd step
+
+static void InstallPropsPatch() {
+    if (!g_knownExe || !g_cfg.smoothProps) return;
+    const BYTE nop2[2] = { 0x90, 0x90 };
+    DWORD dtAddr = reinterpret_cast<DWORD>(&g_simpleBodyDt);
+    const DWORD dtSites[] = { 0x444497, 0x4444AB, 0x4444B8, 0x4444E0, 0x4444FB, 0x444519 };
+    bool ok = PatchBytes(0x4D53BA, nop2, 2);               // je skip -> run simple integrator every step
+    for (DWORD a : dtSites) ok = ok && PatchBytes(a, &dtAddr, 4);
+    g_propsSyncEveryStep = ok;
+    Logf("props: %s\n", ok ? "knocked props simulated and synced every physics step (60 Hz)"
+                            : "patch FAILED");
 }
 
 static void InstallCharacterAnimPatch() {
-    if (!g_knownExe || !g_cfg.smoothCharacterAnims) return;
+    if (!g_knownExe || (!g_cfg.smoothCharacterAnims && !g_propsSyncEveryStep)) return;
     bool ok = PatchCallRel32(hp2::callWorldStepMid, (void*)&Hook_WorldStepMid);
-    Logf("character animation: %s\n", ok ? "actors updated every physics step (60 Hz)" : "patch FAILED");
+    Logf("even-step hook: %s (characters=%d, props=%d)\n", ok ? "installed" : "patch FAILED",
+         g_cfg.smoothCharacterAnims, g_propsSyncEveryStep ? 1 : 0);
 }
 
 static void InstallTickPatch() {
@@ -1242,8 +1296,9 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
         InstallTickPatch();
         InstallSteeringPatch();
         InstallAnimClockPatch();
-        InstallCharacterAnimPatch();
         InstallPropsPatch();
+        InstallParticlesPatch();
+        InstallCharacterAnimPatch();
 
         if (PatchIAT_Direct3DCreate8())
             Logf("D3D IAT patch OK\n");
