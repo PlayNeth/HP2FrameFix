@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.15.5
+// HP2FrameFix.asi  v0.15.6
 // Frame pacing, game clock fix, EAX-on-startup fix and loading speed-up
 // for Need for Speed: Hot Pursuit 2 (PC)
 //
@@ -7,6 +7,9 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.15.6: the car reflection probe (cubemap update, 0x4D7985) gets the car's
+//    blended position too; it used the raw 60 Hz physics position, so the
+//    reflections stepped against the smoothly drawn car.
 // v0.15.5: shift animation pacing reworked - every gear change is animated
 //    again (v0.15.4 skipped quick back-and-forth shifts, like the vanilla game
 //    skipping them). A change during a shift extends it: the hand stays at the
@@ -164,7 +167,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.15.5"
+#define HP2FF_VERSION "0.15.6"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -240,6 +243,8 @@ namespace hp2 {
         { 0x40D626,       "\x8B\x81\x64\x01\x00\x00", 6 },            // active camera slot
         { 0x40C269,       "\x39\x7B\x68", 3 },                           // camera id at +0x68
         { 0x40C756,       "\x8D\x41\x04", 3 },                           // eye at cam+8
+        { 0x4D7985,       "\xE8\x56\x6E\x06\x00", 5 },                 // call reflection cubemap update
+        { 0x4D795A,       "\x8B\x88\xA8\x02\x00\x00", 6 },            // probe pos = body +0x2A8
         { 0x4CAA7F,       "\xE8\x8C\x15\xF6\xFF", 5 },                 // car draw, list B
         { 0x44D6D0,       "\xE8\x3B\xE9\xFD\xFF", 5 },                 // car draw, sim-placed cars
     };
@@ -1666,6 +1671,40 @@ static DWORD __fastcall Hook_BuildView(void* ownerP, void*, DWORD a, DWORD b, DW
     return orig(ownerP, nullptr, a, b, c);
 }
 
+// Car reflections: the world render (0x4D7985) updates the reflection cubemap
+// of the view's car from the car's physics body position - the raw newest step,
+// while the car itself is drawn blended. The probe then jumps in 60 Hz steps
+// against the smoothly moving car. Give it the same blended position.
+namespace hp2 { const DWORD callReflUpdate = 0x4D7985; const DWORD fnReflUpdate = 0x53E7E0; }
+typedef void (__fastcall *ReflUpdate_t)(void* mgr, void* edx, void* view, const float* pos);
+static unsigned long g_ipReflBlended = 0, g_ipReflPass = 0;
+static void __fastcall Hook_ReflUpdate(void* mgr, void*, void* view, const float* pos) {
+    ReflUpdate_t orig = reinterpret_cast<ReflUpdate_t>(hp2::fnReflUpdate);
+    if (g_cfg.interpolate && pos && g_ipCutFrame != g_presentCount) {
+        const IpFrame& f = FrameBlend();
+        if (f.ok) {
+            const IpSnap* n = &g_ipRing[g_ipHead];
+            for (int i = 0; i < n->nCars; i++) {
+                float np[3], nr[9];
+                ToRenderSpace(n->cars[i].x, np, nr);
+                if (!NearlyEqual(np, pos, 3)) continue;
+                const IpCar* a = FindCar(f.A, n->cars[i].veh);
+                const IpCar* b = FindCar(f.B, n->cars[i].veh);
+                if (!a || !b) break;
+                float x[12];
+                if (!BlendXform(a->x, b->x, f.t, x)) break;
+                float bp[3], br[9];
+                ToRenderSpace(x, bp, br);
+                g_ipReflBlended++;
+                orig(mgr, nullptr, view, bp);
+                return;
+            }
+        }
+    }
+    g_ipReflPass++;
+    orig(mgr, nullptr, view, pos);
+}
+
 static void __fastcall Hook_DrawListB(void* car, void*, void* view) {
     g_ipDrawListB++;
     reinterpret_cast<CarDraw_t>(hp2::fnCarDraw)(car, nullptr, view);
@@ -1683,7 +1722,8 @@ static void InstallInterpolation() {
               PatchCallRel32(hp2::callBuildView1,  (void*)&Hook_BuildView) &&
               PatchCallRel32(hp2::callBuildView2,  (void*)&Hook_BuildView) &&
               PatchCallRel32(hp2::callDrawListB,   (void*)&Hook_DrawListB) &&
-              PatchCallRel32(hp2::callDrawSimCar,  (void*)&Hook_DrawSimCar);
+              PatchCallRel32(hp2::callDrawSimCar,  (void*)&Hook_DrawSimCar) &&
+              PatchCallRel32(hp2::callReflUpdate,  (void*)&Hook_ReflUpdate);
     Logf("interpolation: %s (camera=%d, delay=%.2f steps)\n", ok ? "installed" : "patch FAILED",
          g_cfg.interpolateCamera, g_cfg.interpDelay);
 }
@@ -1692,11 +1732,13 @@ static void LogInterpStats() {
     if (!g_cfg.interpolate || !g_knownExe) return;
     Logf("  interp: steps=%lu frames=%lu blended=%lu (avg t %.2f) ahead=%lu behind=%lu | cars blended=%lu "
          "passed=%lu (mismatch %lu, jump %lu) | camera blended=%lu cuts=%lu mismatch=%lu (cut frames %lu) | resets=%lu "
-         "clock snaps=%lu | tracked cars=%d views=%d | other car draws: listB=%lu sim-placed=%lu\n",
+         "clock snaps=%lu | tracked cars=%d views=%d | other car draws: listB=%lu sim-placed=%lu | "
+         "reflection probe blended=%lu passed=%lu\n",
          g_ipSteps, g_ipFrames, g_ipFramesBlended, g_ipFramesBlended ? g_ipAlphaSum / g_ipFramesBlended : 0.0,
          g_ipAhead, g_ipBehind, g_ipCarsBlended, g_ipCarsPass, g_ipCarMismatch, g_ipCarJump,
          g_ipCamsBlended, g_ipCamCut, g_ipCamMismatch, g_ipCutFrames, g_ipResets, g_ipClockSnaps, g_ipNVehs,
-         g_ipNOwners, g_ipDrawListB, g_ipDrawSimCar);
+         g_ipNOwners, g_ipDrawListB, g_ipDrawSimCar, g_ipReflBlended, g_ipReflPass);
+    g_ipReflBlended = g_ipReflPass = 0;
     g_ipSteps = g_ipFrames = g_ipFramesBlended = g_ipAhead = g_ipBehind = g_ipCarsBlended =
         g_ipCarsPass = g_ipCarMismatch = g_ipCarJump = g_ipCamsBlended = g_ipCamCut =
         g_ipCamMismatch = g_ipResets = g_ipClockSnaps = g_ipDrawListB = g_ipDrawSimCar = g_ipCutFrames = 0;
