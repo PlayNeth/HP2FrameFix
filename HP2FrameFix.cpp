@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.17.3
+// HP2FrameFix.asi  v0.17.4
 // Widescreen section: based on HP2WSFix (MIT, Lovro Pleše) - see that section.
 // HD car reflections section: GPL-3.0 (derived from NFSHP2 HD Reflections by
 // Arctic94 / NFS HD Reflections by Aero_) - see the "HD car reflections" section.
@@ -10,6 +10,7 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.17.4: FMVs: the frame's last pixel column (green after filtering) is cropped.
 // v0.17.3: centered text was off to the right: the text measuring code converts
 //    a size with the screen->layout function, which must not subtract the
 //    centering offset there. That call gets a scale-only version.
@@ -196,7 +197,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.17.3"
+#define HP2FF_VERSION "0.17.4"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -2600,11 +2601,20 @@ extern "C" void __cdecl Ws_MovieLayout(void* sprite, int w, int h) {
     typedef void (__fastcall *SetPos_t)(void*, void*, float, float, float);
     float sx = 800.0f / (w > 0 ? w : 1), sy = 600.0f / (h > 0 ? h : 1), x = 0, y = 0;
     DWORD view = *reinterpret_cast<DWORD*>(ws::pView);
-    if (g_cfg.widescreen && g_cfg.wsMovies && w > 0 && h > 0 && view) {
+    if (g_cfg.widescreen && g_cfg.wsMovies && w > 1 && h > 0 && view) {
         int vw = *reinterpret_cast<int*>(view + 0x14), vh = *reinterpret_cast<int*>(view + 0x18);
         if (vw > 0 && vh > 0) {
             float s = (float)vw / w < (float)vh / h ? (float)vw / w : (float)vh / h;
-            sx = sy = s; x = (vw - w * s) * 0.5f; y = (vh - h * s) * 0.5f;
+            sx = sy = s;
+            // The frame's last pixel column is garbage (green) once filtered:
+            // show the movie through a viewport that ends one movie pixel early,
+            // with the 2D projection rebuilt for that viewport (0x54FFD0).
+            float vx = floorf((vw - w * s) * 0.5f), vy = floorf((vh - h * s) * 0.5f);
+            float cw = floorf((w - 1) * s), ch = floorf(h * s);
+            typedef void (__fastcall *SetVP_t)(DWORD, void*, float, float, float, float, float, float);
+            typedef void (__fastcall *Ortho_t)(DWORD, void*, float, float);
+            reinterpret_cast<SetVP_t>(0x54F990)(view, nullptr, vx, vy, cw, ch, 0.0f, 1.0f);
+            reinterpret_cast<Ortho_t>(0x54FFD0)(view, nullptr, 0.0f, 200.0f);
         }
     }
     reinterpret_cast<SetScale_t>(vt[2])(sprite, nullptr, sx, sy);
