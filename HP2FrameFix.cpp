@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.17.8
+// HP2FrameFix.asi  v0.17.9
 // Widescreen section: based on HP2WSFix (MIT, Lovro Pleše) - see that section.
 // HD car reflections section: GPL-3.0 (derived from NFSHP2 HD Reflections by
 // Arctic94 / NFS HD Reflections by Aero_) - see the "HD car reflections" section.
@@ -10,6 +10,9 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.17.9: Hor+ only for views that ask for exactly the whole screen (race
+//    view). Views cropped by the screen (showroom car) already keep their
+//    shape via the game's own crop factors - correcting them squished the car.
 // v0.17.7: Hor+ reworked: each 3D view keeps the look it had on a 4:3 screen
 //    (its viewport clipped to 4:3 vs now) - whatever aspect it passes.
 // v0.17.6: showroom cars were stretched sideways: their viewport is wider than
@@ -201,7 +204,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.17.8"
+#define HP2FF_VERSION "0.17.9"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -2562,7 +2565,15 @@ static void __fastcall Ws_Projection(void* view, void*, float fov, float aspect,
             float x0 = vx > cx0 ? (float)vx : cx0, x1 = vx + vw < cx0 + cw ? (float)(vx + vw) : cx0 + cw;
             float y0 = vy > cy0 ? (float)vy : cy0, y1 = vy + vh < cy0 + ch ? (float)(vy + vh) : cy0 + ch;
             float a1 = (float)vw / vh;
-            if (x1 - x0 > 8.0f && y1 - y0 > 8.0f) {
+            // SetViewport (0x54F990) crops views that run past the screen and keeps
+            // factors (view+0x11C/0x120) so the projection keeps the requested
+            // shape - the showroom car is such a view: its shape is the layout's
+            // and already right. Only views asking for exactly the screen (race
+            // view) get Hor+.
+            const float* fs = reinterpret_cast<const float*>(v + 0x11C);
+            bool wholeScreen = fabsf(fs[0] - 1.0f) < 0.01f && fabsf(fs[1] - 1.0f) < 0.01f &&
+                               vx <= 1 && vy <= 1 && vw >= sw - 2 && vh >= sh - 2;
+            if (wholeScreen && x1 - x0 > 8.0f && y1 - y0 > 8.0f) {
                 float a0 = (x1 - x0) / (y1 - y0), r = a1 / a0;
                 bool fix = fabsf(r - 1.0f) > 0.01f;
                 if (!fix && g_cfg.wsLog) {
