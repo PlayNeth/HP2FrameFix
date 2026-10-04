@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.17.6
+// HP2FrameFix.asi  v0.17.7
 // Widescreen section: based on HP2WSFix (MIT, Lovro Pleše) - see that section.
 // HD car reflections section: GPL-3.0 (derived from NFSHP2 HD Reflections by
 // Arctic94 / NFS HD Reflections by Aero_) - see the "HD car reflections" section.
@@ -10,6 +10,8 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.17.7: Hor+ reworked: each 3D view keeps the look it had on a 4:3 screen
+//    (its viewport clipped to 4:3 vs now) - whatever aspect it passes.
 // v0.17.6: showroom cars were stretched sideways: their viewport is wider than
 //    4:3 once the menus are centered - big 3D views of any shape get Hor+.
 // v0.17.5: v0.17.4's FMV column crop removed (its viewport stayed set for the race).
@@ -199,7 +201,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.17.6"
+#define HP2FF_VERSION "0.17.7"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -2539,21 +2541,45 @@ static void __fastcall Ws_WidgetRender(void* w, void*, void* renderer, DWORD fla
     ws::xscale = sx; ws::yscale = sy; ws::xpos = px; ws::ypos = py;
 }
 
-// 3D projection: Hor+ for 4:3 projections that fill a wider screen.
+// 3D projection (Hor+). For each view, the viewport the original game would
+// have had is this one clipped to a 4:3 screen (centered 4:3 part of ours).
+// If the shape differs (race view on 16:9, the showroom car whose widget is
+// wider than the 800x600 layout), the FOV is widened so the vertical view and
+// the proportions stay as in the original. Views inside that area (mirror,
+// small previews) are unchanged.
 typedef void (__fastcall *Projection_t)(void* view, void* edx, float fov, float aspect, float zn, float zf);
+static int g_wsProjLogged = 0;
 static void __fastcall Ws_Projection(void* view, void*, float fov, float aspect, float zn, float zf) {
-    if (g_cfg.widescreen && g_cfg.wsFixFOV && fabsf(aspect - 4.0f / 3.0f) < 0.02f) {
-        int vw = *reinterpret_cast<int*>(reinterpret_cast<BYTE*>(view) + 0x14);
-        int vh = *reinterpret_cast<int*>(reinterpret_cast<BYTE*>(view) + 0x18);
-        // big views (race view, showroom car; their viewport can be wider than
-        // 4:3 now that nothing clips it to the 800x600 area) - not the mirror
-        if (vw > 0 && vh > 0 && vw * 2 >= ws::scrW && vh * 2 >= ws::scrH) {
-            float a = (float)vw / vh;
-            if (fabsf(a - aspect) > 0.01f && fov > 1.0f && fov < 179.0f) {
-                const float d2r = 3.14159265f / 180.0f;
-                float f = 2.0f * atanf(tanf(fov * 0.5f * d2r) * a / aspect) / d2r;
-                if (f > 170.0f) f = 170.0f;
-                fov = f; aspect = a; g_wsProjFixed++;
+    if (g_cfg.widescreen && g_cfg.wsFixFOV && fov > 1.0f && fov < 179.0f && aspect > 0.1f) {
+        BYTE* v = reinterpret_cast<BYTE*>(view);
+        int vx = *reinterpret_cast<int*>(v + 0x0C), vy = *reinterpret_cast<int*>(v + 0x10);
+        int vw = *reinterpret_cast<int*>(v + 0x14), vh = *reinterpret_cast<int*>(v + 0x18);
+        int sw = ws::scrW, sh = ws::scrH;
+        if (vw > 0 && vh > 0 && sw > 0 && sh > 0) {
+            float cw = (float)sw, ch = (float)sh;                   // centered 4:3 area
+            if (cw * 3.0f > ch * 4.0f) cw = ch * 4.0f / 3.0f; else ch = cw * 3.0f / 4.0f;
+            float cx0 = (sw - cw) * 0.5f, cy0 = (sh - ch) * 0.5f;
+            float x0 = vx > cx0 ? (float)vx : cx0, x1 = vx + vw < cx0 + cw ? (float)(vx + vw) : cx0 + cw;
+            float y0 = vy > cy0 ? (float)vy : cy0, y1 = vy + vh < cy0 + ch ? (float)(vy + vh) : cy0 + ch;
+            float a1 = (float)vw / vh;
+            if (x1 - x0 > 8.0f && y1 - y0 > 8.0f) {
+                float a0 = (x1 - x0) / (y1 - y0), r = a1 / a0;
+                bool fix = fabsf(r - 1.0f) > 0.01f;
+                if (fix) {
+                    const float d2r = 3.14159265f / 180.0f;
+                    float f = 2.0f * atanf(tanf(fov * 0.5f * d2r) * r) / d2r;
+                    if (f > 170.0f) f = 170.0f;
+                    static DWORD seen[20];
+                    DWORD key = (DWORD)vw << 16 | (DWORD)vh;
+                    bool isNew = true;
+                    for (int k = 0; k < g_wsProjLogged; k++) if (seen[k] == key) isNew = false;
+                    if (g_cfg.wsLog && isNew && g_wsProjLogged < 20) {
+                        seen[g_wsProjLogged++] = key;
+                        Logf("widescreen: 3D view %dx%d at %d,%d (4:3 screen: %.0fx%.0f): fov %.1f -> %.1f, "
+                             "aspect %.3f -> %.3f\n", vw, vh, vx, vy, x1 - x0, y1 - y0, fov, f, aspect, aspect * r);
+                    }
+                    fov = f; aspect *= r; g_wsProjFixed++;
+                }
             }
         }
     }
