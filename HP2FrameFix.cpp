@@ -7,6 +7,9 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.15.2-interp: a camera whose view direction turns > 45 deg (or rolls, or
+//    whose fov jumps) within one step counts as a cut - look back on cameras
+//    that flip the same camera object was blended through the car.
 // v0.15.1-interp: a frame whose camera can't be blended (look back / camera
 //    switch / jump) now draws the cars un-blended too - they were a step away
 //    from the camera for a frame, which flickered when looking back.
@@ -150,7 +153,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.15.1-interp"
+#define HP2FF_VERSION "0.15.2-interp"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -1529,6 +1532,25 @@ static void __fastcall Hook_CarSetXform(void* car, void*, void* view, const floa
     reinterpret_cast<CarSetXform_t>(hp2::fnCarSetXform)(car, nullptr, view, pos, rot);
 }
 
+// A camera that flips or swings in one step (look back on cameras that turn the
+// same camera object around, quick pans) must not be blended: halfway through a
+// 180-degree flip the view sits inside the car.
+static bool CameraJumped(const float* a, const float* b) {
+    float dx = b[0]-a[0], dy = b[1]-a[1], dz = b[2]-a[2];
+    if (dx*dx + dy*dy + dz*dz > g_cfg.maxStepDistance * g_cfg.maxStepDistance) return true;
+    float da[3] = { a[3]-a[0], a[4]-a[1], a[5]-a[2] }, db[3] = { b[3]-b[0], b[4]-b[1], b[5]-b[2] };
+    float la = sqrtf(da[0]*da[0] + da[1]*da[1] + da[2]*da[2]);
+    float lb = sqrtf(db[0]*db[0] + db[1]*db[1] + db[2]*db[2]);
+    if (la < 1e-4f || lb < 1e-4f) return true;
+    float c = (da[0]*db[0] + da[1]*db[1] + da[2]*db[2]) / (la * lb);
+    if (c < 0.7071f) return true;                                  // view turned > 45 deg
+    float ua = sqrtf(a[7]*a[7] + a[8]*a[8] + a[9]*a[9]), ub = sqrtf(b[7]*b[7] + b[8]*b[8] + b[9]*b[9]);
+    if (ua > 1e-4f && ub > 1e-4f &&
+        (a[7]*b[7] + a[8]*b[8] + a[9]*b[9]) / (ua * ub) < 0.7071f) return true;   // rolled > 45 deg
+    if (fabsf(b[6] - a[6]) > 0.2f * (fabsf(a[6]) + 1e-3f)) return true;          // fov jumped > 20 %
+    return false;
+}
+
 static void MarkCutFrame() {
     if (g_ipCutFrame != g_presentCount) { g_ipCutFrame = g_presentCount; g_ipCutFrames++; }
 }
@@ -1554,8 +1576,7 @@ static DWORD __fastcall Hook_BuildView(void* ownerP, void*, DWORD a, DWORD b, DW
             } else if (!NearlyEqual(cur, cn->f, 10)) {
                 g_ipCamMismatch++; MarkCutFrame();              // moved outside a step
             } else {
-                float dx = cb->f[0]-ca->f[0], dy = cb->f[1]-ca->f[1], dz = cb->f[2]-ca->f[2];
-                if (dx*dx + dy*dy + dz*dz > g_cfg.maxStepDistance * g_cfg.maxStepDistance) {
+                if (CameraJumped(ca->f, cb->f)) {
                     g_ipCamCut++; MarkCutFrame();
                 } else {
                     float bl[10];
