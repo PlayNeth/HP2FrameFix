@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.17.10
+// HP2FrameFix.asi  v0.17.11
 // Widescreen section: based on HP2WSFix (MIT, Lovro Pleše) - see that section.
 // HD car reflections section: GPL-3.0 (derived from NFSHP2 HD Reflections by
 // Arctic94 / NFS HD Reflections by Aero_) - see the "HD car reflections" section.
@@ -10,6 +10,9 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.17.11: camera interpolation stopped from the 5th race on: each race makes
+//    a new camera owner and the list of 4 never dropped old ones (now LRU).
+//    EA Trax chyron at the left screen edge in the menus too.
 // v0.17.10: the EA Trax chyron in races (child of the race GUI root,
 //    SimGUIInterface) goes to the left edge with the rest of the HUD.
 // v0.17.9: Hor+ only for views that ask for exactly the whole screen (race
@@ -206,7 +209,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.17.10"
+#define HP2FF_VERSION "0.17.11"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -1442,6 +1445,7 @@ static LONGLONG g_ipLastStepQpc = 0;
 struct IpVeh { DWORD veh, car; unsigned long long seen; };
 static IpVeh  g_ipVehs[kIpCars]; static int g_ipNVehs = 0;
 static DWORD  g_ipOwners[kIpCams]; static int g_ipNOwners = 0;
+static unsigned long long g_ipOwnerSeen[kIpCams];
 static DWORD  g_ipPendingCar = 0, g_ipPendingVeh = 0;
 // A view built this frame with an un-blended camera (cut / switch / mismatch):
 // draw the cars un-blended too, or they'd sit a step away from the camera.
@@ -1813,8 +1817,14 @@ static DWORD __fastcall Hook_BuildView(void* ownerP, void*, DWORD a, DWORD b, DW
     DWORD owner = reinterpret_cast<DWORD>(ownerP);
     if (!g_cfg.interpolate || !g_cfg.interpolateCamera) return orig(ownerP, nullptr, a, b, c);
     bool known = false;
-    for (int i = 0; i < g_ipNOwners; i++) if (g_ipOwners[i] == owner) known = true;
-    if (!known && g_ipNOwners < kIpCams) g_ipOwners[g_ipNOwners++] = owner;
+    for (int i = 0; i < g_ipNOwners; i++)
+        if (g_ipOwners[i] == owner) { known = true; g_ipOwnerSeen[i] = g_presentCount; }
+    if (!known) {                 // each race makes a new camera owner: replace the stalest
+        int slot = g_ipNOwners < kIpCams ? g_ipNOwners++ : 0;
+        if (slot == 0 && g_ipNOwners == kIpCams)
+            for (int i = 1; i < kIpCams; i++) if (g_ipOwnerSeen[i] < g_ipOwnerSeen[slot]) slot = i;
+        g_ipOwners[slot] = owner; g_ipOwnerSeen[slot] = g_presentCount;
+    }
     const IpFrame& f = FrameBlend();
     if (f.ok) {
         const IpCam* ca = FindCam(f.A, owner);
@@ -2384,7 +2394,7 @@ static ws::GPoint* __cdecl Ws_PointToLayout(ws::GPoint* out, const ws::GPoint* i
 
 // --- widget classes, recorded when a widget reads its GUI.mBounds -------------
 struct WsWidget { DWORD w, vt; BYTE flags; char name[23]; };
-enum { kWsHudView = 1, kWsImage = 2, kWsActor = 4, kWsLogged = 8 };
+enum { kWsHudView = 1, kWsImage = 2, kWsActor = 4, kWsLogged = 8, kWsChyron = 32 };
 static const int kWsTable = 8192;
 static WsWidget g_wsWidgets[kWsTable];
 
@@ -2416,6 +2426,7 @@ static DWORD __fastcall Ws_ReadBounds(void* reader, void*, const char* key, void
     e->w = w; e->vt = *reinterpret_cast<DWORD*>(w); e->flags = 0;
     strncpy(e->name, name, sizeof(e->name) - 1); e->name[sizeof(e->name) - 1] = 0;
     const char* cls = strrchr(name, '.'); cls = cls ? cls + 1 : name;
+    if (!strcmp(cls, "ChyronCtl")) e->flags |= kWsChyron;           // EA Trax: left screen edge
     if (!strcmp(cls, "SimGUIInterface")) e->flags |= kWsHudView;   // race GUI root: EA Trax chyron
     if (!strcmp(cls, "HudView")) {
         e->flags |= kWsHudView;
@@ -2478,6 +2489,9 @@ static WsMode WsClassify(DWORD w) {
                  p ? p->name : "-", *reinterpret_cast<int*>(w + 0x10));
         }
     }
+    // EA Trax chyron (menus and races): its edge pieces start left of the
+    // layout and are cut at its edge - keep that cut on the screen edge.
+    if (e && (e->flags & kWsChyron) && g_cfg.wsHudToEdges && g_wsOffX > 0.5f) return kWsLeft;
     // HUD: elements on the HUD's left/right third go to the screen edges. Only
     // the parent has to be known (the minimap is made by code, not loaded).
     if (g_cfg.wsHudToEdges && g_wsOffX > 0.5f) {
