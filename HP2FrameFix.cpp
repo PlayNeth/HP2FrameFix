@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.18.6
+// HP2FrameFix.asi  v0.18.7
 // Widescreen section: based on HP2WSFix (MIT, Lovro Pleše) - see that section.
 // HD car reflections section: GPL-3.0 (derived from NFSHP2 HD Reflections by
 // Arctic94 / NFS HD Reflections by Aero_) - see the "HD car reflections" section.
@@ -10,6 +10,13 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.18.7: audio mode (EAX) fix reworked. The sound engine reads the audio mode
+//    only when it starts, which is before the saved profile is applied; the
+//    profile apply (0x536BA0) copies the mode but never restarts the engine (the
+//    options menu does). The profile apply is now wrapped: if a loaded profile
+//    changes the mode of the running engine, the engine is restarted once, like
+//    the menu does. Replaces the 90-frame "EAX on but not active" watch; works
+//    for any mode. eaxFixStableFrames is no longer used.
 // v0.18.6: NFSHP2 Weather Mod 0.9.x compatibility: it treats any render target
 //    640+ wide as the race view, so HD cubemap faces (768+) broke its rain and
 //    fog. While a module with that check is loaded, the cubemap is capped at
@@ -217,7 +224,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.18.6"
+#define HP2FF_VERSION "0.18.7"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -509,9 +516,8 @@ static void LoadConfig() {
                 "smoothParticles=1\n"
                 "; log per-character animation update rates (diagnostics)\n"
                 "animDiag=0\n"
-                "; --- EAX: re-apply saved EAX mode after startup ---\n"
+                "; --- audio: apply the saved audio mode (e.g. EAX) when the profile loads ---\n"
                 "fixEAXOnStartup=1\n"
-                "eaxFixStableFrames=90\n"
                 "; --- loading ---\n"
                 "speedUpLoading=1\n"
                 "; draw the loading screen at most every N ms (0 = every step, -1 = never)\n"
@@ -901,9 +907,17 @@ static void InstallLoadingPatch() {
 // ---------------------------------------------------------------------------
 // EAX-on-startup fix
 // ---------------------------------------------------------------------------
-static bool g_eaxFixDone = false;
-static int  g_eaxBadFrames = 0;
-static int  g_eaxLastMode = -99, g_eaxLastActive = -1, g_eaxLastReady = -1;
+// Root cause: the sound engine reads the audio mode (options+0x938) only when it
+// starts (0x514A30). At startup it starts with the default mode; the saved
+// profile is applied later by Profile::Apply (0x536BA0), which copies the mode
+// into the options but never restarts the engine. The options menu does restart
+// it (0x446360) when the mode changes, which is why switching by hand works.
+// Fix: the three calls of Profile::Apply go through a wrapper; if the profile
+// changed the mode of an engine that is already running, the engine is
+// restarted once, on the next front-end frame (same call the menu makes).
+// ---------------------------------------------------------------------------
+static int  g_applyOldMode = -1;
+static bool g_audioPending = false;
 static bool g_inRestartAudio = false;
 
 static bool ReadAudioState(int* mode, int* eaxActive, int* soundReady) {
@@ -917,30 +931,64 @@ static bool ReadAudioState(int* mode, int* eaxActive, int* soundReady) {
     *mode = m; *eaxActive = a; *soundReady = r ? 1 : 0;
     return true;
 }
+static const char* AudioModeName(int m) {
+    return m == 1 ? "stereo" : m == 2 ? "mono" : m == 3 ? "EAX" : m == 0 ? "mode 0" : "unknown mode";
+}
+extern "C" void __cdecl AudioPreApply() {
+    int m, a, r;
+    g_applyOldMode = ReadAudioState(&m, &a, &r) ? m : -1;
+}
+extern "C" void __cdecl AudioPostApply(DWORD result) {
+    int m, a, r;
+    if (!(result & 0xFF) || !ReadAudioState(&m, &a, &r)) return;
+    if (m != g_applyOldMode && r) {
+        Logf("audio: profile sets %s (engine running in %s) - restarting the sound engine\n",
+             AudioModeName(m), AudioModeName(g_applyOldMode));
+        g_audioPending = true;
+    } else {
+        Logf("audio: profile applied, mode %s%s\n", AudioModeName(m),
+             r ? "" : " (sound engine not started yet - it will start in this mode)");
+    }
+}
+extern "C" void ProfileApplyStub();
+__asm__(
+    ".globl _ProfileApplyStub\n"
+    "_ProfileApplyStub:\n"               // replaces call Profile::Apply (thiscall, 1 arg)
+    "    pushl %ecx\n"
+    "    call _AudioPreApply\n"
+    "    popl %ecx\n"
+    "    pushl 4(%esp)\n"
+    "    movl $0x536BA0, %eax\n"
+    "    call *%eax\n"                    // ret 4 pops the copied arg
+    "    pushl %eax\n"
+    "    pushl %eax\n"
+    "    call _AudioPostApply\n"
+    "    addl $4, %esp\n"
+    "    popl %eax\n"
+    "    ret $4\n");
+
+static void InstallAudioModeFix() {
+    if (!g_knownExe || !g_cfg.fixEAXOnStartup) return;
+    static const DWORD kCalls[] = { 0x447B99, 0x45845B, 0x4586E3 };
+    int n = 0;
+    for (DWORD at : kCalls) {
+        BYTE* p = (BYTE*)at;
+        if (p[0] == 0xE8 && at + 5 + *(int*)(p + 1) == 0x536BA0 && PatchCallRel32(at, (void*)&ProfileApplyStub)) n++;
+    }
+    Logf("audio: saved audio mode applied on profile load (%d/3 calls hooked)\n", n);
+}
 
 static void EAXFixTick(LONGLONG now) {
-    if (!g_knownExe || !g_cfg.fixEAXOnStartup || g_eaxFixDone) return;
+    if (!g_audioPending) return;
     int mode, active, ready;
-    if (!ReadAudioState(&mode, &active, &ready)) return;
-
-    if (mode != g_eaxLastMode || active != g_eaxLastActive || ready != g_eaxLastReady) {
-        Logf("audio state: mode=%d (%s) eaxActive=%d soundReady=%d\n", mode,
-             mode == hp2::kAudioModeEAX ? "EAX" : "not EAX", active, ready);
-        g_eaxLastMode = mode; g_eaxLastActive = active; g_eaxLastReady = ready;
-    }
-
-    bool bad = mode == hp2::kAudioModeEAX && !active && ready && !LoadingNow(now);
-    g_eaxBadFrames = bad ? g_eaxBadFrames + 1 : 0;
-    if (g_eaxBadFrames < g_cfg.eaxFixStableFrames) return;
-
-    g_eaxFixDone = true;   // one attempt per launch
-    Logf("EAX fix: option is EAX but engine has EAX off - calling RestartAudio()\n");
+    if (!ReadAudioState(&mode, &active, &ready) || !ready || LoadingNow(now)) return;
+    g_audioPending = false;
     g_inRestartAudio = true;
     reinterpret_cast<void (*)()>(hp2::fnRestartAudio)();
     g_inRestartAudio = false;
     if (ReadAudioState(&mode, &active, &ready))
-        Logf("EAX fix: after restart mode=%d eaxActive=%d%s\n", mode, active,
-             active ? " - OK" : " - driver did not accept EAX (is DSOAL installed?)");
+        Logf("audio: engine now in %s%s\n", AudioModeName(mode),
+             mode == hp2::kAudioModeEAX ? (active ? " - EAX active" : " - EAX not accepted by the driver (is DSOAL installed?)") : "");
 }
 
 // ---------------------------------------------------------------------------
@@ -3121,6 +3169,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
         }
         PatchIAT_Timers();
         InstallLoadingPatch();
+        InstallAudioModeFix();
         InstallTickPatch();
         InstallSteeringPatch();
         InstallAnimClockPatch();
