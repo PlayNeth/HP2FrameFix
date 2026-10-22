@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.18.7
+// HP2FrameFix.asi  v0.18.8
 // Widescreen section: based on HP2WSFix (MIT, Lovro Pleše) - see that section.
 // HD car reflections section: GPL-3.0 (derived from NFSHP2 HD Reflections by
 // Arctic94 / NFS HD Reflections by Aero_) - see the "HD car reflections" section.
@@ -10,6 +10,15 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.18.8: code review fixes. Character/driver animations no longer freeze
+//    after the game resets its step counter (new race or phase) - they used to
+//    wait until the counter caught up with its old value. If the tick
+//    scheduler thread can't start, the game's own timer is used (it used to
+//    stop the simulation). Sleep fallback of the scheduler gets 1 ms timer
+//    resolution from the first tick. IAT/vtable pointer patches keep execute
+//    rights. wsMenuResolution=2 reads the desktop mode from the registry (not
+//    the current fullscreen mode). wsLog=2 no longer logs code-made widgets
+//    every frame once its 64-entry table is full. animDiag counters locked.
 // v0.18.7: audio mode (EAX) fix reworked. The sound engine reads the audio mode
 //    only when it starts, which is before the saved profile is applied; the
 //    profile apply (0x536BA0) copies the mode but never restarts the engine (the
@@ -224,7 +233,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.18.7"
+#define HP2FF_VERSION "0.18.8"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -670,7 +679,7 @@ static void OpenLog() {
 // ---------------------------------------------------------------------------
 static bool PatchPointer(void** slot, void* newValue, void** oldValue) {
     DWORD oldProt;
-    if (!VirtualProtect(slot, sizeof(void*), PAGE_READWRITE, &oldProt)) return false;
+    if (!VirtualProtect(slot, sizeof(void*), PAGE_EXECUTE_READWRITE, &oldProt)) return false;
     if (oldValue) *oldValue = *slot;
     *slot = newValue;
     DWORD dummy;
@@ -732,7 +741,7 @@ static bool CheckExeSignatures() {
         if (IsBadReadPtr(reinterpret_cast<void*>(s.addr), s.len) ||
             memcmp(reinterpret_cast<void*>(s.addr), s.bytes, s.len) != 0) {
             Logf("exe check: bytes at 0x%06lX differ - not the analysed NFSHP2.exe, "
-                 "EAX and loading fixes disabled\n", (unsigned long)s.addr);
+                 "game-specific fixes disabled\n", (unsigned long)s.addr);
             return false;
         }
     }
@@ -1058,6 +1067,10 @@ static DWORD WINAPI TickSchedulerThread(LPVOID) {
         GetProcAddress(GetModuleHandleA("kernel32.dll"), "CreateWaitableTimerExW"));
     HANDLE timer = pCreate ? pCreate(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
                                      TIMER_ALL_ACCESS) : nullptr;
+    if (!timer && !g_timerResRaised) {                   // Sleep fallback needs 1 ms resolution
+        timeBeginPeriod(1);                              // from the first tick, not the first frame
+        g_timerResRaised = true;
+    }
     const LONGLONG freq = g_qpcFreq.QuadPart;
 
     LONG     gen = -1;
@@ -1122,6 +1135,12 @@ static MMRESULT WINAPI Hook_timeSetEvent(UINT delay, UINT res, LPTIMECALLBACK cb
         !(flags & TIME_PERIODIC)) {
         if (!g_tickThread) {
             g_tickThread = CreateThread(nullptr, 0, TickSchedulerThread, nullptr, 0, nullptr);
+            if (!g_tickThread) {                         // no scheduler: keep the game's own timer
+                g_ticksActive = false;
+                Logf("game ticks: scheduler thread FAILED - using the game's timer\n");
+                return g_origTimeSetEvent ? g_origTimeSetEvent(delay, res, cb, user, flags)
+                                          : ::timeSetEvent(delay, res, cb, user, flags);
+            }
             Logf("game ticks: precise scheduler started (rate=%d Hz)\n", GameTickRate());
         }
         g_tickUser = (DWORD)user;
@@ -1262,8 +1281,14 @@ static void AnimDiagRecord(const AnimChannelSet* cs, double steps) {
     e.clipVt = clipVt; e.rate = rate; e.length = length;
 }
 
+static void AnimDiagFlushLocked(double seconds);
 static void AnimDiagFlush(double seconds) {
     if (!g_cfg.animDiag || !g_animDiagCount || seconds <= 0) return;
+    EnterCriticalSection(&g_animLock);
+    AnimDiagFlushLocked(seconds);
+    LeaveCriticalSection(&g_animLock);
+}
+static void AnimDiagFlushLocked(double seconds) {
     Logf("anim diag (%.1fs): %d character clips%s\n", seconds, g_animDiagCount,
          g_animDiagDropped ? " (table full)" : "");
     for (int i = 0; i < g_animDiagCount; ++i) {
@@ -1282,6 +1307,16 @@ static bool __fastcall Hook_AnimAdvance(AnimChannelSet* cs, void*) {
         return false;
     }
     const int counter = *reinterpret_cast<volatile int*>(hp2::pStepCounter);
+    if (counter < cs->lastStep) {                        // step counter reset (new race/phase):
+        cs->lastStep = counter;                          // start over from here instead of
+        cs->elapsed = 0;                                 // waiting for it to catch up
+        if (g_cfg.smoothSlowMotionAnims) {
+            EnterCriticalSection(&g_animLock);
+            if (AnimClockEntry* e = AnimClockFor(cs)) { e->lastStep = counter; e->lastClock = GameStepClock(); }
+            LeaveCriticalSection(&g_animLock);
+        }
+        return false;
+    }
 
     double steps;
     if (g_cfg.smoothSlowMotionAnims) {
@@ -1299,6 +1334,7 @@ static bool __fastcall Hook_AnimAdvance(AnimChannelSet* cs, void*) {
             if (steps < 0.0 || steps > 600.0) {          // clock went backwards or huge jump: resync
                 e->lastClock = now;
                 e->lastStep = counter;
+                cs->lastStep = counter;
                 steps = 0.0;
             } else if (steps > 1e-6) {
                 e->lastClock = now;
@@ -1310,7 +1346,11 @@ static bool __fastcall Hook_AnimAdvance(AnimChannelSet* cs, void*) {
         steps = (double)(counter - cs->lastStep);
     }
 
-    AnimDiagRecord(cs, steps);
+    if (g_cfg.animDiag) {                                // shared with the flush at Present
+        EnterCriticalSection(&g_animLock);
+        AnimDiagRecord(cs, steps);
+        LeaveCriticalSection(&g_animLock);
+    }
     if (!(steps > 1e-6)) {
         cs->elapsed = 0;                                 // nothing advanced: flag left as is
         return false;
@@ -1912,7 +1952,7 @@ static bool CameraJumped(const float* a, const float* b) {
 
 // The blended camera used for this frame's view, per owner, so the reflection
 // update (which reads the camera eye itself) can see the same camera.
-struct IpViewCam { DWORD owner, cam; unsigned long frame; float f[10]; };
+struct IpViewCam { DWORD owner, cam; unsigned long long frame; float f[10]; };
 static IpViewCam g_ipViewCams[kIpCams];
 static void RememberViewCam(DWORD owner, DWORD cam, const float* f) {
     int slot = 0;
@@ -2382,8 +2422,8 @@ static void InstallReflections() {
         auto pot = [](int x) { if (x <= 0) return 128; int p = 1; while ((p << 1) <= x) p <<= 1; return p; };
         cube = pot(cube); env = pot(env);
     }
-    if (cube < 32) cube = 32; if (cube > 4096) cube = 4096;
-    if (env < 32) env = 32;   if (env > 4096) env = 4096;
+    cube = cube < 32 ? 32 : cube > 4096 ? 4096 : cube;
+    env  = env  < 32 ? 32 : env  > 4096 ? 4096 : env;
     g_reflCubeRes = (float)cube; g_reflEnvRes = (float)env; g_reflEnvScale = (float)env / 256.0f;
 
     DWORD v; bool ok = true;
@@ -2681,7 +2721,8 @@ static bool WsOnce(const WsWidget* e, DWORD w, int which) {   // which: 0 = draw
     BYTE bit = which ? 16 : kWsLogged;
     if (e) { if (e->flags & bit) return false; const_cast<WsWidget*>(e)->flags |= bit; return true; }
     for (int i = 0; i < g_wsSeenNoNameN[which]; i++) if (g_wsSeenNoName[which][i] == w) return false;
-    if (g_wsSeenNoNameN[which] < 64) g_wsSeenNoName[which][g_wsSeenNoNameN[which]++] = w;
+    if (g_wsSeenNoNameN[which] >= 64) return false;      // table full: stop logging these
+    g_wsSeenNoName[which][g_wsSeenNoNameN[which]++] = w;
     return true;
 }
 
@@ -2878,7 +2919,9 @@ static bool __fastcall Ws_ValidateModes(void* caps, void*, void* table, DWORD fl
         }
         if (w <= 0 || h <= 0) {
             DEVMODEA dm = {}; dm.dmSize = sizeof(dm);
-            if (EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm)) { w = dm.dmPelsWidth; h = dm.dmPelsHeight; }
+            // registry = the desktop mode even while the game is fullscreen in another mode
+            if (EnumDisplaySettingsA(nullptr, ENUM_REGISTRY_SETTINGS, &dm) ||
+                EnumDisplaySettingsA(nullptr, ENUM_CURRENT_SETTINGS, &dm)) { w = dm.dmPelsWidth; h = dm.dmPelsHeight; }
         }
         FindMode_t find = reinterpret_cast<FindMode_t>(ws::fnFindMode);
         if (w >= 640 && h >= 480 && (find(table, w, h, 32) != -1 || find(table, w, h, 16) != -1)) {
