@@ -1,4 +1,4 @@
-// HP2FrameFix.asi  v0.18.8
+// HP2FrameFix.asi  v0.18.9
 // Widescreen section: based on HP2WSFix (MIT, Lovro Pleše) - see that section.
 // HD car reflections section: GPL-3.0 (derived from NFSHP2 HD Reflections by
 // Arctic94 / NFS HD Reflections by Aero_) - see the "HD car reflections" section.
@@ -10,6 +10,8 @@
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
+// v0.18.9: weather mod cubemap cap removed (Weather Mod fixed its render-target
+//    check, so reflWeatherModCap is gone); unused eaxFixStableFrames removed.
 // v0.18.8: code review fixes. Character/driver animations no longer freeze
 //    after the game resets its step counter (new race or phase) - they used to
 //    wait until the counter caught up with its old value. If the tick
@@ -25,7 +27,7 @@
 //    options menu does). The profile apply is now wrapped: if a loaded profile
 //    changes the mode of the running engine, the engine is restarted once, like
 //    the menu does. Replaces the 90-frame "EAX on but not active" watch; works
-//    for any mode. eaxFixStableFrames is no longer used.
+//    for any mode.
 // v0.18.6: NFSHP2 Weather Mod 0.9.x compatibility: it treats any render target
 //    640+ wide as the race view, so HD cubemap faces (768+) broke its rain and
 //    fog. While a module with that check is loaded, the cubemap is capped at
@@ -219,7 +221,6 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <mmsystem.h>
-#include <tlhelp32.h>
 #include <d3d8.h>
 #include <atomic>
 #include <cmath>
@@ -233,7 +234,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.18.8"
+#define HP2FF_VERSION "0.18.9"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -335,7 +336,6 @@ struct Config {
     int   smoothParticles      = 1;
     float tickPhase            = 0.75f; // where ticks sit inside each tick slot after a frame deadline
     int   fixEAXOnStartup      = 1;
-    int   eaxFixStableFrames   = 90;    // frames the bad state must persist first
     int   speedUpLoading       = 1;
     int   loadScreenRenderMs   = 100;   // 0 = every step (original), -1 = never
     int   limiterDuringLoading = 0;
@@ -351,7 +351,6 @@ struct Config {
     float reflBrightness       = 1.0f;
     int   reflFullDetail       = 1;     // all 6 faces even on lower in-game reflection detail
     int   reflAllFacesEveryFrame = 1;   // no alternating halves (seam flicker)
-    int   reflWeatherModCap    = 1;     // cubemap < 640 while a weather mod that needs it is loaded
     int   interpolate          = 1;     // blend cars between 60 Hz physics steps
     int   interpolateCamera    = 1;     // blend the camera too
     float interpDelay          = 1.0f;  // steps behind the newest step that frames are drawn
@@ -437,10 +436,7 @@ static const char kReflBlock[] =
     "; render the full dynamic reflection even when the in-game reflection detail is lower\n"
     "reflFullDetail=1\n"
     "; render all 6 cubemap faces every frame (the game alternates halves -> seam flicker at HD)\n"
-    "reflAllFacesEveryFrame=1\n"
-    "; NFSHP2 Weather Mod 0.9.x takes any render target 640+ wide for the race view (rain/fog break):\n"
-    "; while it is loaded, cap the cubemap at 639 (512 with reflPowerOfTwo=1). Environment map unaffected.\n"
-    "reflWeatherModCap=1\n";
+    "reflAllFacesEveryFrame=1\n";
 
 static const char kWsBlock[] =
     "; --- widescreen (reworked from HP2WSFix by xan1242 / hdbeefup) ---\n"
@@ -564,7 +560,6 @@ static void LoadConfig() {
         else if (!_stricmp(key, "smoothParticles"))      g_cfg.smoothParticles = atoi(val);
         else if (!_stricmp(key, "tickPhase"))            g_cfg.tickPhase = (float)atof(val);
         else if (!_stricmp(key, "fixEAXOnStartup"))      g_cfg.fixEAXOnStartup = atoi(val);
-        else if (!_stricmp(key, "eaxFixStableFrames"))   g_cfg.eaxFixStableFrames = atoi(val);
         else if (!_stricmp(key, "speedUpLoading"))       g_cfg.speedUpLoading = atoi(val);
         else if (!_stricmp(key, "loadScreenRenderMs"))   g_cfg.loadScreenRenderMs = atoi(val);
         else if (!_stricmp(key, "limiterDuringLoading")) g_cfg.limiterDuringLoading = atoi(val);
@@ -578,7 +573,6 @@ static void LoadConfig() {
         else if (!_stricmp(key, "reflBrightness"))       g_cfg.reflBrightness = (float)atof(val);
         else if (!_stricmp(key, "reflFullDetail"))       g_cfg.reflFullDetail = atoi(val);
         else if (!_stricmp(key, "reflAllFacesEveryFrame")) g_cfg.reflAllFacesEveryFrame = atoi(val);
-        else if (!_stricmp(key, "reflWeatherModCap"))    g_cfg.reflWeatherModCap = atoi(val);
         else if (!_stricmp(key, "interpolate"))          { g_cfg.interpolate = atoi(val); sawInterp = true; }
         else if (!_stricmp(key, "interpolateCamera"))    g_cfg.interpolateCamera = atoi(val);
         else if (!_stricmp(key, "interpDelay"))          g_cfg.interpDelay = (float)atof(val);
@@ -2328,81 +2322,6 @@ __asm__(
 
 static float g_reflCubeRes = 128.f, g_reflEnvRes = 128.f, g_reflEnvScale = 0.5f;
 
-// Weather mod compatibility. NFSHP2 Weather Mod 0.9.x (weather.dll, loaded via
-// its Hp2ModInit export) hooks SetRenderTarget/SetViewport and treats any
-// render target (or 0,0 viewport) 640+ wide as the race view; it draws its
-// rain and fog when the game leaves that target. Cubemap faces 640+ wide pass
-// the check, so rain and fog go wrong (fat drops, no fog). While a module with
-// that check is loaded, the faces are capped below 640. Checked each time the
-// reflection manager builds its targets (vtable slot 0x665484 -> 0x53DFC0), so
-// load order doesn't matter, and the cap goes away once the mod no longer has
-// the check.
-namespace hp2 {
-    const DWORD vtReflSetup = 0x665484, fnReflSetupThunk = 0x53DE90;
-}
-static int g_reflCubeWanted = 128, g_reflCubeApplied = 128;
-typedef void (__fastcall *ReflSetup_t)(void* mgr, void* edx);
-
-static bool ModuleHasBytes(HMODULE h, const BYTE* pat, size_t len) {
-    auto dos = reinterpret_cast<PIMAGE_DOS_HEADER>(h);
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
-    auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(reinterpret_cast<BYTE*>(h) + dos->e_lfanew);
-    auto sec = IMAGE_FIRST_SECTION(nt);
-    for (WORD i = 0; i < nt->FileHeader.NumberOfSections; i++, sec++) {
-        if (!(sec->Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
-        const BYTE* p = reinterpret_cast<BYTE*>(h) + sec->VirtualAddress;
-        DWORD n = sec->Misc.VirtualSize;
-        if (n < len || IsBadReadPtr(p, n)) continue;
-        for (DWORD o = 0; o + len <= n; o++)
-            if (p[o] == pat[0] && memcmp(p + o, pat, len) == 0) return true;
-    }
-    return false;
-}
-
-// The weather mod's SetRenderTarget check: cmp dword [esp+58h], 280h / setae al
-static HMODULE FindWeatherModWithCheck(char* name, size_t nameLen) {
-    static const BYTE kCheck[] = { 0x81, 0x7C, 0x24, 0x58, 0x80, 0x02, 0x00, 0x00, 0x0F, 0x93, 0xC0 };
-    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPMODULE, 0);
-    if (snap == INVALID_HANDLE_VALUE) return nullptr;
-    MODULEENTRY32 me; me.dwSize = sizeof(me);
-    HMODULE found = nullptr;
-    for (BOOL ok = Module32First(snap, &me); ok && !found; ok = Module32Next(snap, &me)) {
-        if (!GetProcAddress(me.hModule, "Hp2ModInit")) continue;
-        if (ModuleHasBytes(me.hModule, kCheck, sizeof(kCheck))) {
-            found = me.hModule;
-            lstrcpynA(name, me.szModule, (int)nameLen);
-        }
-    }
-    CloseHandle(snap);
-    return found;
-}
-
-static void SetCubeRes(int res) {
-    DWORD v = (DWORD)res;
-    PatchBytes(0x53E176, &v, 4);
-    PatchBytes(0x53E17B, &v, 4);
-    g_reflCubeRes = (float)res;          // the cube viewport reads this (0x53E16A)
-    g_reflCubeApplied = res;
-}
-
-static void __fastcall Hook_ReflSetup(void* mgr, void* edx) {
-    int want = g_reflCubeWanted;
-    if (want >= 640) {
-        char name[MAX_PATH] = "";
-        int cap = g_cfg.reflPowerOfTwo ? 512 : 639;
-        int res = FindWeatherModWithCheck(name, sizeof(name)) ? cap : want;
-        if (res != g_reflCubeApplied) {
-            SetCubeRes(res);
-            if (res != want)
-                Logf("HD reflections: %s treats render targets 640+ wide as the race view - "
-                     "cubemap %d -> %d while it is loaded (reflWeatherModCap=0 turns this off)\n", name, want, res);
-            else
-                Logf("HD reflections: weather mod check gone - cubemap back to %d\n", want);
-        }
-    }
-    reinterpret_cast<ReflSetup_t>(hp2::fnReflSetupThunk)(mgr, edx);
-}
-
 static void InstallReflections() {
     if (!g_knownExe || !g_cfg.hdReflections) { Logf("HD reflections: off\n"); return; }
     for (const auto& sg : hp2::kReflSigs)
@@ -2434,13 +2353,6 @@ static void InstallReflections() {
     // they used is left alone (nothing else in the game reads it, so writing
     // it was never needed).
     ok &= PatchBytes(0x53E12C, &pe, 4) && PatchBytes(0x53E16A, &pc, 4);
-    g_reflCubeWanted = g_reflCubeApplied = cube;
-    if (cube >= 640 && g_cfg.reflWeatherModCap) {
-        DWORD cur = 0, hook = reinterpret_cast<DWORD>(&Hook_ReflSetup);
-        SafeRead(hp2::vtReflSetup, &cur);
-        if (cur == hp2::fnReflSetupThunk) ok &= PatchBytes(hp2::vtReflSetup, &hook, 4);
-        else Logf("HD reflections: reflection setup slot changed by another mod - weather mod cap off\n");
-    }
     ok &= PatchBytes(0x53EB4F, &g_reflEnvScale, 4) && PatchBytes(0x53EB54, &g_reflEnvScale, 4) &&
           PatchBytes(0x53ED47, &g_reflEnvScale, 4) && PatchBytes(0x53ED4C, &g_reflEnvScale, 4);
     if (g_cfg.reflBrightness != 1.0f) {
@@ -2867,7 +2779,6 @@ static void __fastcall Ws_Projection(void* view, void*, float fov, float aspect,
                     for (int k = 0; k < nU; k++) if (seenU[k] == key) isNew = false;
                     if (isNew && nU < 20) {
                         seenU[nU++] = key;
-                        const float* fs = reinterpret_cast<const float*>(v + 0x11C);
                         Logf("widescreen: 3D view %dx%d at %d,%d unchanged: fov %.1f aspect %.3f | vp factors %.3f %.3f\n",
                              vw, vh, vx, vy, fov, aspect, fs[0], fs[1]);
                     }
@@ -2882,7 +2793,6 @@ static void __fastcall Ws_Projection(void* view, void*, float fov, float aspect,
                     for (int k = 0; k < g_wsProjLogged; k++) if (seen[k] == key) isNew = false;
                     if (g_cfg.wsLog && isNew && g_wsProjLogged < 20) {
                         seen[g_wsProjLogged++] = key;
-                        const float* fs = reinterpret_cast<const float*>(v + 0x11C);
                         const float* fo = reinterpret_cast<const float*>(v + 0x154);
                         Logf("widescreen: 3D view %dx%d at %d,%d (4:3 screen: %.0fx%.0f): fov %.1f -> %.1f, "
                              "aspect %.3f -> %.3f | vp factors %.3f %.3f offs %.3f %.3f %.3f %.3f\n",
