@@ -209,7 +209,7 @@
 #define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
 #endif
 
-#define HP2FF_VERSION "0.17.11"
+#define HP2FF_VERSION "0.18.5"
 
 // ---------------------------------------------------------------------------
 // Game addresses (NFSHP2.exe, image base 0x400000, no relocations)
@@ -342,6 +342,18 @@ struct Config {
     int   wsMovies             = 1;
     int   wsUnlockResolutions  = 1;
     int   wsLog                = 1;
+    int   wsNoLetterbox        = 0;
+    // memory pools (v0.18, from HP2WSFix's [MEMORY] section)
+    int   memoryPools          = 0;
+    float memGeneral           = 0;     // MB, 0 = automatic (game's spare room + all pools)
+    float memRender            = 0;     // MB, 0 = game default
+    float memTrack             = 0;
+    float memUI                = 0;
+    float memCars              = 0;
+    float memAudio             = 0;
+    float memLevel             = 0;
+    float memCharacter         = 0;
+    float memReplay            = 0;
 };
 
 static Config g_cfg;
@@ -416,12 +428,37 @@ static const char kWsBlock[] =
     "wsBackgrounds=2\n"
     "; in-race HUD: move the elements on the left/right side to the screen edges\n"
     "wsHudToEdges=1\n"
-    "; FMVs: scale to fit with their aspect ratio, centered\n"
+    "; FMVs: 1 = 4:3 picture centered (as the game shows them), 2 = keep the video file's shape,\n"
+    ";        0 = stretch over the screen (game default)\n"
     "wsMovies=1\n"
+    "; car select / race results: remove the black bars at the top and bottom\n"
+    "wsNoLetterbox=0\n"
     "; list every display mode in the options (the game hides some)\n"
     "wsUnlockResolutions=1\n"
     "; log what the widescreen code adjusts (2 = also every widget drawn, for diagnostics)\n"
     "wsLog=1\n";
+
+static const char kMemBlock[] =
+    "; --- memory pools (from HP2WSFix): bigger fixed-size memory pools for mods ---\n"
+    "; only needed for mods with high-poly cars or HD textures (missing textures, crashes on load)\n"
+    "; (turned on automatically when any size below is set)\n"
+    "memoryPools=0\n"
+    "; sizes in MB, 0 = game default (render 7.2, track 43, UI 4, cars 7, audio 10,\n"
+    "; level 1.6, character 1.5, replay 0.4)\n"
+    "; HD mod example: memRender=256  memTrack=128  memUI=128  (car textures load into the track pool)\n"
+    "; the total must fit in one block: up to 1 GB, or just under 2 GB with the 4GB patch on the exe\n"
+    "; (too much and the game keeps its defaults - the log says why)\n"
+    "memRender=0\n"
+    "memTrack=0\n"
+    "memUI=0\n"
+    "memCars=0\n"
+    "memAudio=0\n"
+    "memLevel=0\n"
+    "memCharacter=0\n"
+    "memReplay=0\n"
+    "; all pools above are carved out of the general pool: 0 = sized automatically\n"
+    "; (the game's own spare room plus every pool), or set an exact size in MB\n"
+    "memGeneral=0\n";
 
 static void LoadConfig() {
     if (g_cfgLoaded) return;
@@ -474,12 +511,13 @@ static void LoadConfig() {
             fputs(kInterpBlock, f);
             fputs(kReflBlock, f);
             fputs(kWsBlock, f);
+            fputs(kMemBlock, f);
             fclose(f);
         }
         return;
     }
     char line[256];
-    bool sawInterp = false, sawRefl = false, sawWs = false;
+    bool sawInterp = false, sawRefl = false, sawWs = false, sawMem = false, sawWsNoLb = false;
     while (fgets(line, sizeof(line), f)) {
         if (line[0] == ';' || line[0] == '#' || line[0] == '\r' || line[0] == '\n') continue;
         char key[64] = {}, val[64] = {};
@@ -527,6 +565,17 @@ static void LoadConfig() {
         else if (!_stricmp(key, "wsMovies"))             g_cfg.wsMovies = atoi(val);
         else if (!_stricmp(key, "wsUnlockResolutions"))  g_cfg.wsUnlockResolutions = atoi(val);
         else if (!_stricmp(key, "wsLog"))                g_cfg.wsLog = atoi(val);
+        else if (!_stricmp(key, "wsNoLetterbox"))        { g_cfg.wsNoLetterbox = atoi(val); sawWsNoLb = true; }
+        else if (!_stricmp(key, "memoryPools"))          { g_cfg.memoryPools = atoi(val); sawMem = true; }
+        else if (!_stricmp(key, "memGeneral"))           g_cfg.memGeneral = (float)atof(val);
+        else if (!_stricmp(key, "memRender"))            g_cfg.memRender = (float)atof(val);
+        else if (!_stricmp(key, "memTrack"))             g_cfg.memTrack = (float)atof(val);
+        else if (!_stricmp(key, "memUI"))                g_cfg.memUI = (float)atof(val);
+        else if (!_stricmp(key, "memCars"))              g_cfg.memCars = (float)atof(val);
+        else if (!_stricmp(key, "memAudio"))             g_cfg.memAudio = (float)atof(val);
+        else if (!_stricmp(key, "memLevel"))             g_cfg.memLevel = (float)atof(val);
+        else if (!_stricmp(key, "memCharacter"))         g_cfg.memCharacter = (float)atof(val);
+        else if (!_stricmp(key, "memReplay"))            g_cfg.memReplay = (float)atof(val);
     }
     fclose(f);
     if (!sawInterp) {                     // ini from an older version: add the new keys
@@ -540,6 +589,18 @@ static void LoadConfig() {
     if (!sawWs) {
         FILE* a = fopen(path, "a");
         if (a) { fputs("\n", a); fputs(kWsBlock, a); fclose(a); }
+    }
+    if (sawWs && !sawWsNoLb) {
+        FILE* a = fopen(path, "a");
+        if (a) {
+            fputs("\n; car select / race results: remove the black bars at the top and bottom\n"
+                  "wsNoLetterbox=0\n", a);
+            fclose(a);
+        }
+    }
+    if (!sawMem) {
+        FILE* a = fopen(path, "a");
+        if (a) { fputs("\n", a); fputs(kMemBlock, a); fclose(a); }
     }
 }
 
@@ -2394,7 +2455,7 @@ static ws::GPoint* __cdecl Ws_PointToLayout(ws::GPoint* out, const ws::GPoint* i
 
 // --- widget classes, recorded when a widget reads its GUI.mBounds -------------
 struct WsWidget { DWORD w, vt; BYTE flags; char name[23]; };
-enum { kWsHudView = 1, kWsImage = 2, kWsActor = 4, kWsLogged = 8, kWsChyron = 32 };
+enum { kWsHudView = 1, kWsImage = 2, kWsActor = 4, kWsLogged = 8, kWsChyron = 32, kWsLetterbox = 64 };
 static const int kWsTable = 8192;
 static WsWidget g_wsWidgets[kWsTable];
 
@@ -2438,6 +2499,10 @@ static DWORD __fastcall Ws_ReadBounds(void* reader, void*, const char* key, void
                                         "GImageBar", "HudStaticArt" };
     for (const char* c : kImg) if (!strcmp(cls, c)) e->flags |= kWsImage;
     if (strstr(cls, "Actor")) e->flags |= kWsActor;
+    // car select / results letterbox bars (the names HP2WSFix hides)
+    static const char* const kBars[] = { "boxT.GImageBox", "tttt.GImageBox", "T.GImageBox",
+                                         "boxB.GImageBox", "bbbb.GImageBox", "B.GImageBox" };
+    for (const char* b : kBars) if (!strcmp(name, b)) e->flags |= kWsLetterbox;
     if ((e->flags & kWsHudView) && g_cfg.wsLog && g_wsLogLines < 900) {
         g_wsLogLines++;
         const ws::GRect* rc = static_cast<const ws::GRect*>(rect);
@@ -2501,11 +2566,23 @@ static WsMode WsClassify(DWORD w) {
                                                   *reinterpret_cast<int*>(pw + 0x6C) - 4)) {
             int px = *reinterpret_cast<int*>(w + 0x68), pwid = *reinterpret_cast<int*>(pw + 0x6C);
             int ew = *reinterpret_cast<int*>(w + 0x6C);
+            int py = *reinterpret_cast<int*>(w + 0x64), ph = *reinterpret_cast<int*>(pw + 0x70);
+            int eh = *reinterpret_cast<int*>(w + 0x70);
             if (pwid > 0 && ew < pwid * 6 / 10) {
                 int cx2 = 2 * px + ew;                        // 2 * center
                 if (cx2 * 3 < 2 * pwid) m = kWsLeft;
                 else if (cx2 * 3 > 4 * pwid) m = kWsRight;
+            } else if (pwid > 0 && ew < pwid - 8 && !(e && (e->flags & kWsImage))) {
+                // wide text boxes (multiplayer chat / status lines): anchored by
+                // the side they start or end at, if they hug that side
+                if (px <= pwid / 20) m = kWsLeft;
+                else if (px + ew >= pwid - pwid / 20) m = kWsRight;
             }
+            // full-screen containers inside the HUD (multiplayer chat/status
+            // layers) hold HUD parts too: their children get the same treatment
+            if (m == kWsNone && e && !(e->flags & kWsImage) && pwid > 0 && ph > 0 &&
+                px <= 4 && py <= 4 && ew >= pwid - 8 && eh >= ph - 8)
+                const_cast<WsWidget*>(e)->flags |= kWsHudView;
             if (g_cfg.wsLog && g_wsLogLines < 900 && WsOnce(e, w, 1)) {
                 g_wsLogLines++;
                 Logf("widescreen: HUD %s at %d,%d %dx%d -> %s\n", e ? e->name : "(made by code)", px,
@@ -2537,7 +2614,12 @@ static WsMode WsClassify(DWORD w) {
 
 typedef void (__fastcall *WidgetRender_t)(void* w, void* edx, void* renderer, DWORD flags);
 static WidgetRender_t g_wsRenderTramp = nullptr;
+static unsigned long g_wsBarsHidden = 0;
 static void __fastcall Ws_WidgetRender(void* w, void*, void* renderer, DWORD flags) {
+    if (g_cfg.wsNoLetterbox) {
+        const WsWidget* e = WsFind(reinterpret_cast<DWORD>(w));
+        if (e && (e->flags & kWsLetterbox)) { g_wsBarsHidden++; return; }
+    }
     WsMode m = WsActive() ? WsClassify(reinterpret_cast<DWORD>(w)) : kWsNone;
     if (m == kWsNone) { g_wsRenderTramp(w, nullptr, renderer, flags); return; }
     float sx = ws::xscale, sy = ws::yscale, px = ws::xpos, py = ws::ypos;
@@ -2677,8 +2759,14 @@ extern "C" void __cdecl Ws_MovieLayout(void* sprite, int w, int h) {
     if (g_cfg.widescreen && g_cfg.wsMovies && w > 0 && h > 0 && view) {
         int vw = *reinterpret_cast<int*>(view + 0x14), vh = *reinterpret_cast<int*>(view + 0x18);
         if (vw > 0 && vh > 0) {
-            float s = (float)vw / w < (float)vh / h ? (float)vw / w : (float)vh / h;
-            sx = sy = s; x = (vw - w * s) * 0.5f; y = (vh - h * s) * 0.5f;
+            // The game always stretches movies over its 4:3 screen, and some are
+            // stored in a different shape (EA intro) - so by default show them
+            // as a 4:3 picture; wsMovies=2 keeps the file's own shape.
+            float bw = (float)w, bh = (float)h;
+            if (g_cfg.wsMovies != 2) { bw = 4.0f; bh = 3.0f; }
+            float s = (float)vw / bw < (float)vh / bh ? (float)vw / bw : (float)vh / bh;
+            float dw = bw * s, dh = bh * s;
+            sx = dw / w; sy = dh / h; x = (vw - dw) * 0.5f; y = (vh - dh) * 0.5f;
         }
     }
     reinterpret_cast<SetScale_t>(vt[2])(sprite, nullptr, sx, sy);
@@ -2753,10 +2841,167 @@ static void InstallWidescreen() {
 
 static void LogWidescreenStats() {
     if (!g_wsOn) return;
-    if (g_wsProjFixed || g_wsShifted || g_wsBgScaled)
-        Logf("  widescreen: Hor+ projections %lu | HUD draws moved to edges %lu | backgrounds scaled %lu\n",
-             g_wsProjFixed, g_wsShifted, g_wsBgScaled);
-    g_wsProjFixed = g_wsShifted = g_wsBgScaled = 0;
+    if (g_wsProjFixed || g_wsShifted || g_wsBgScaled || g_wsBarsHidden)
+        Logf("  widescreen: Hor+ projections %lu | HUD draws moved to edges %lu | backgrounds scaled %lu"
+             " | letterbox bars hidden %lu\n", g_wsProjFixed, g_wsShifted, g_wsBgScaled, g_wsBarsHidden);
+    g_wsProjFixed = g_wsShifted = g_wsBgScaled = g_wsBarsHidden = 0;
+}
+
+// ---------------------------------------------------------------------------
+// Memory pools (v0.18, from HP2WSFix's [MEMORY] section)
+//
+// At startup (0x53BBC0, called from 0x537819) the game mallocs one general
+// heap and then carves fixed-size class pools out of it (0x53B9E0, each via
+// 0x53BB30). The sizes are push/mov immediates. Mods with high-poly cars or
+// HD textures overflow the render/track/UI pools. Korean language uses bigger
+// render/UI/general sizes in separate immediates.
+// Differences from HP2WSFix: the Korean UI size is patched at 0x53BA36 (it
+// wrote 0x53BA35, the opcode byte, which corrupts the instruction on Korean),
+// and the general heap grows with the pools by default instead of having to
+// be sized by hand (pools larger than the general heap fail to allocate).
+// ---------------------------------------------------------------------------
+namespace mem {
+    struct Pool { const char* name; DWORD imm, immKor, out, def, defKor; float* cfg; };
+    static Pool kPools[] = {
+        { "render",    0x53BA84, 0x53BA7D, 0x83C1A4, 0x732000,  0xF32000,  &g_cfg.memRender },
+        { "track",     0x53BA04, 0,        0x83C1A8, 0x2B00000, 0,         &g_cfg.memTrack },
+        { "UI",        0x53BA27, 0x53BA36, 0x83C1C4, 0x400000,  0xA00000,  &g_cfg.memUI },
+        { "cars",      0x53BA59, 0,        0x83C1B0, 0x700000,  0,         &g_cfg.memCars },
+        { "audio",     0x53B9EE, 0,        0x83C1B4, 0xA00000,  0,         &g_cfg.memAudio },
+        { "level",     0x53BA1A, 0,        0x83C1AC, 0x196000,  0,         &g_cfg.memLevel },
+        { "character", 0x53BA9D, 0,        0x83C1BC, 0x17D000,  0,         &g_cfg.memCharacter },
+        { "replay",    0x53BAB3, 0,        0x83C1C0, 0x64000,   0,         &g_cfg.memReplay },
+        { "ini file",  0x53BADC, 0,        0x83C1C8, 0x10000,   0,         nullptr },
+    };
+    const DWORD immGeneral = 0x53BBC2, immGeneralKor = 0x53BBD1;
+    const DWORD defGeneral = 0x5FB9000, defGeneralKor = 0x6DB9000;
+    const DWORD callSetup = 0x537819, fnSetup = 0x53BBC0;
+    const DWORD fnLanguage = 0x547C30;    // returns 6 for Korean
+    const DWORD pHeapOwner = 0x8519B8;    // [owner]+0x58 = general heap
+}
+static bool g_memOn = false;
+
+static DWORD MemBytes(float mb, DWORD def) {
+    if (!(mb > 0)) return def;
+    if (mb > 1024) mb = 1024;
+    DWORD b = (DWORD)((double)mb * 1048576.0);
+    return (b + 0xFFF) & ~0xFFFu;
+}
+static double MB(DWORD b) { return b / 1048576.0; }
+
+static void __cdecl Hook_MemSetup() {
+    reinterpret_cast<void(*)()>(mem::fnSetup)();
+    bool kor = reinterpret_cast<int(*)()>(mem::fnLanguage)() == 6;
+    DWORD owner = 0, heap = 0;
+    SafeRead(mem::pHeapOwner, &owner);
+    if (owner) SafeRead(owner + 0x58, &heap);
+    DWORD gen = *reinterpret_cast<DWORD*>(kor ? mem::immGeneralKor : mem::immGeneral);
+    Logf("memory pools: general heap %.1f MB %s\n", MB(gen), heap ? "OK" : "FAILED (malloc) - lower memGeneral");
+    for (const auto& p : mem::kPools) {
+        DWORD a = (kor && p.immKor) ? p.immKor : p.imm;
+        DWORD size = *reinterpret_cast<DWORD*>(a), h = 0;
+        SafeRead(p.out, &h);
+        Logf("  %-9s %7.1f MB %s\n", p.name, MB(size),
+             h ? "OK" : "FAILED - general heap too small (memGeneral=0 sizes it automatically)");
+    }
+}
+
+static void InstallMemoryPools() {
+    bool anySet = g_cfg.memGeneral > 0 || g_cfg.memRender > 0 || g_cfg.memTrack > 0 || g_cfg.memUI > 0 ||
+                  g_cfg.memCars > 0 || g_cfg.memAudio > 0 || g_cfg.memLevel > 0 || g_cfg.memCharacter > 0 ||
+                  g_cfg.memReplay > 0;
+    if (!g_cfg.memoryPools && anySet) {
+        g_cfg.memoryPools = 1;
+        Logf("memory pools: sizes set in the ini - turned on\n");
+    }
+    if (!g_cfg.memoryPools) { Logf("memory pools: off (game defaults)\n"); return; }
+    if (!g_knownExe) { Logf("memory pools: unknown exe, left alone\n"); return; }
+    BYTE* c = reinterpret_cast<BYTE*>(mem::callSetup);
+    if (c[0] != 0xE8 || *reinterpret_cast<DWORD*>(c + 1) != mem::fnSetup - (mem::callSetup + 5)) {
+        Logf("memory pools: startup code changed, left alone\n"); return;
+    }
+    // every immediate must still hold the game's value (HP2WSFix also patches these)
+    auto same = [](DWORD a, DWORD v) { return *reinterpret_cast<DWORD*>(a) == v; };
+    bool clean = same(mem::immGeneral, mem::defGeneral) && same(mem::immGeneralKor, mem::defGeneralKor);
+    for (const auto& p : mem::kPools)
+        clean = clean && same(p.imm, p.def) && (!p.immKor || same(p.immKor, p.defKor));
+    if (!clean) {
+        Logf("memory pools: sizes already changed (HP2WSFix.asi loaded? remove it) - left alone\n");
+        return;
+    }
+    auto nt = reinterpret_cast<PIMAGE_NT_HEADERS>(0x400000 + reinterpret_cast<PIMAGE_DOS_HEADER>(0x400000)->e_lfanew);
+    bool laa = (nt->FileHeader.Characteristics & IMAGE_FILE_LARGE_ADDRESS_AWARE) != 0;
+
+    // sizes first (64-bit sums: huge values must not wrap around)
+    unsigned long long sumDef = 0, sumDefKor = 0, sum = 0, sumKor = 0;
+    DWORD val[16], valK[16];
+    int n = 0;
+    for (const auto& p : mem::kPools) {
+        DWORD defK = p.immKor ? p.defKor : p.def;
+        DWORD v  = p.cfg ? MemBytes(*p.cfg, p.def) : p.def;
+        DWORD vK = (p.cfg && *p.cfg > 0) ? v : defK;
+        sumDef += p.def; sumDefKor += defK; sum += v; sumKor += vK;
+        val[n] = v; valK[n] = vK; n++;
+    }
+    // the general heap must hold every pool plus the game's own spare room
+    unsigned long long gen    = mem::defGeneral    - sumDef    + sum;
+    unsigned long long genKor = mem::defGeneralKor - sumDefKor + sumKor;
+    if (g_cfg.memGeneral > 0) {
+        unsigned long long want = MemBytes(g_cfg.memGeneral, mem::defGeneral);
+        if (want < gen)
+            Logf("memory pools: memGeneral=%g MB is too small for the pools (needs at least %.1f MB) "
+                 "- using %.1f MB\n", g_cfg.memGeneral, gen / 1048576.0, gen / 1048576.0);
+        if (want > gen) gen = want;
+        if (want > genKor) genKor = want;
+    }
+    unsigned long long big = gen > genKor ? gen : genKor;
+
+    // Can the game get that block? It is one malloc, so it needs one free
+    // stretch of address space that big, and the rest of the game (Direct3D,
+    // textures, the HD reflections) still needs room elsewhere. Limits: 1 GB
+    // without the 4GB patch, just under 2 GB with it (the game's 2002 allocator
+    // can't take sizes past 2 GB). Then a test reservation of the block, and
+    // with it held, at least 384 MB must stay free elsewhere.
+    const unsigned long long limit = laa ? 0x7F000000ull : 0x40000000ull;
+    const char* why = nullptr;
+    if (big > limit) why = laa ? "over the 2 GB limit" : "over the 1 GB limit without the 4GB patch";
+    else {
+        void* test = VirtualAlloc(nullptr, (SIZE_T)big, MEM_RESERVE, PAGE_NOACCESS);
+        if (!test) why = "no free block of address space that large";
+        else {
+            unsigned long long freeRest = 0;
+            MEMORY_BASIC_INFORMATION mbi;
+            for (BYTE* q = nullptr; VirtualQuery(q, &mbi, sizeof(mbi)) == sizeof(mbi); ) {
+                if (mbi.State == MEM_FREE) freeRest += mbi.RegionSize;
+                BYTE* next = static_cast<BYTE*>(mbi.BaseAddress) + mbi.RegionSize;
+                if (next <= q) break;
+                q = next;
+            }
+            VirtualFree(test, 0, MEM_RELEASE);
+            if (freeRest < 0x18000000ull) why = "too little memory would be left for the rest of the game";
+        }
+    }
+    if (why) {
+        Logf("memory pools: general heap of %.1f MB (pools %.1f MB) can't be allocated - %s. "
+             "Game defaults kept; lower the sizes (large address aware exe: %s)\n",
+             big / 1048576.0, sum / 1048576.0, why, laa ? "yes" : "no");
+        return;
+    }
+
+    bool ok = true;
+    n = 0;
+    for (const auto& p : mem::kPools) {
+        DWORD defK = p.immKor ? p.defKor : p.def, v = val[n], vK = valK[n]; n++;
+        if (v != p.def) ok &= PatchBytes(p.imm, &v, 4);
+        if (p.immKor && vK != defK) ok &= PatchBytes(p.immKor, &vK, 4);
+    }
+    DWORD g = (DWORD)gen, gK = (DWORD)genKor;
+    if (g != mem::defGeneral)       ok &= PatchBytes(mem::immGeneral, &g, 4);
+    if (gK != mem::defGeneralKor)   ok &= PatchBytes(mem::immGeneralKor, &gK, 4);
+    ok &= PatchCallRel32(mem::callSetup, (void*)&Hook_MemSetup);
+    g_memOn = ok;
+    Logf("memory pools: %s (general %.1f MB, pools %.1f MB, large address aware exe: %s)\n",
+         ok ? "installed" : "patch FAILED", gen / 1048576.0, sum / 1048576.0, laa ? "yes" : "no");
 }
 
 // ---------------------------------------------------------------------------
@@ -2788,6 +3033,7 @@ BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID reserved) {
         InstallInterpolation();
         InstallReflections();
         InstallWidescreen();
+        InstallMemoryPools();
 
         if (PatchIAT_Direct3DCreate8())
             Logf("D3D IAT patch OK\n");
