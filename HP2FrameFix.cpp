@@ -1,222 +1,61 @@
-// HP2FrameFix.asi  v0.18.9
+// HP2FrameFix.asi
+// Frame pacing, precise game timing, smoother animation, interpolation, HD car
+// reflections, widescreen, memory pools and fixes for Need for Speed: Hot
+// Pursuit 2 (PC). Version history: CHANGELOG.md.
 // Widescreen section: based on HP2WSFix (MIT, Lovro Pleše) - see that section.
 // HD car reflections section: GPL-3.0 (derived from NFSHP2 HD Reflections by
 // Arctic94 / NFS HD Reflections by Aero_) - see the "HD car reflections" section.
-// Frame pacing, game clock fix, EAX-on-startup fix and loading speed-up
-// for Need for Speed: Hot Pursuit 2 (PC)
 //
 // Addresses below were found by disassembling NFSHP2.exe
 // (SHA-1 63147101c2ca814e964f31c06730b1292093d7f4, PE timestamp 0x3DDDE96C).
 // Every patch checks the original bytes first and disables itself on a
 // different exe, so the ASI is still safe to load on other versions.
 //
-// v0.18.9: weather mod cubemap cap removed (Weather Mod fixed its render-target
-//    check, so reflWeatherModCap is gone); unused eaxFixStableFrames removed.
-// v0.18.8: code review fixes. Character/driver animations no longer freeze
-//    after the game resets its step counter (new race or phase) - they used to
-//    wait until the counter caught up with its old value. If the tick
-//    scheduler thread can't start, the game's own timer is used (it used to
-//    stop the simulation). Sleep fallback of the scheduler gets 1 ms timer
-//    resolution from the first tick. IAT/vtable pointer patches keep execute
-//    rights. wsMenuResolution=2 reads the desktop mode from the registry (not
-//    the current fullscreen mode). wsLog=2 no longer logs code-made widgets
-//    every frame once its 64-entry table is full. animDiag counters locked.
-// v0.18.7: audio mode (EAX) fix reworked. The sound engine reads the audio mode
-//    only when it starts, which is before the saved profile is applied; the
-//    profile apply (0x536BA0) copies the mode but never restarts the engine (the
-//    options menu does). The profile apply is now wrapped: if a loaded profile
-//    changes the mode of the running engine, the engine is restarted once, like
-//    the menu does. Replaces the 90-frame "EAX on but not active" watch; works
-//    for any mode.
-// v0.18.6: NFSHP2 Weather Mod 0.9.x compatibility: it treats any render target
-//    640+ wide as the race view, so HD cubemap faces (768+) broke its rain and
-//    fog. While a module with that check is loaded, the cubemap is capped at
-//    639 (512 with reflPowerOfTwo); checked at each reflection setup, so load
-//    order doesn't matter (reflWeatherModCap=0 turns it off). Also: the shared
-//    128.0f at 0x665474 is no longer overwritten (only the two redirected
-//    reflection viewports read it, so the write was never needed).
-// v0.17.11: camera interpolation stopped from the 5th race on: each race makes
-//    a new camera owner and the list of 4 never dropped old ones (now LRU).
-//    EA Trax chyron at the left screen edge in the menus too.
-// v0.17.10: the EA Trax chyron in races (child of the race GUI root,
-//    SimGUIInterface) goes to the left edge with the rest of the HUD.
-// v0.17.9: Hor+ only for views that ask for exactly the whole screen (race
-//    view). Views cropped by the screen (showroom car) already keep their
-//    shape via the game's own crop factors - correcting them squished the car.
-// v0.17.7: Hor+ reworked: each 3D view keeps the look it had on a 4:3 screen
-//    (its viewport clipped to 4:3 vs now) - whatever aspect it passes.
-// v0.17.6: showroom cars were stretched sideways: their viewport is wider than
-//    4:3 once the menus are centered - big 3D views of any shape get Hor+.
-// v0.17.5: v0.17.4's FMV column crop removed (its viewport stayed set for the race).
-// v0.17.3: centered text was off to the right: the text measuring code converts
-//    a size with the screen->layout function, which must not subtract the
-//    centering offset there. That call gets a scale-only version.
-// v0.17.2: the minimap sits in the HUD root's parent (<HUD>.GWidget), not in
-//    HudView - that container's side elements go to the edges too.
-// v0.17.1: the minimap (made by code, so never seen loading) goes to the left edge
-//    like the rest of the HUD; wsLog=2 logs every widget drawn.
-// v0.17: widescreen support (widescreen and ws* keys), reworked from HP2WSFix:
-//    centered undistorted menus/HUD at any aspect, full-screen backgrounds
-//    filled, HUD side elements at the screen edges, Hor+ 3D FOV, menus at the
-//    in-game resolution, aspect-correct FMVs, all display modes listed.
-// v0.16.3: the blended camera now stays in the camera object for the whole frame
-//    render instead of only during BuildView. Each car copies the camera eye in
-//    CarSetXform (0x42B940 -> car+0xB60) for its sun specular, so the glints
-//    were computed from the raw step camera - up to a step away at speed. The
-//    raw camera is put back before the next physics step and at Present.
-// v0.16.2: v0.16.1 also swapped the body rotation during the cubemap update;
-//    the game caches the car's draw transform there, so the player car was
-//    drawn unblended (cars mismatch ~1 per frame). Removed; camera part kept.
-// v0.16.1: sun glints / reflections on the car no longer wobble with interpolation.
-//    The cubemap update (0x53E380) aims the sphere map at the camera eye (read
-//    through the view, 0x40CFD0) and, in one mode, along the body rotation
-//    (body+0x2B4) - both were the raw physics-step values while the car and
-//    view were drawn blended. The update now sees the blended camera and body.
-// v0.16: HD car reflections built in (hdReflections and refl* keys), including
-//    the fix for the cubemap's alternating halves (seam flicker).
-// v0.15.6: the car reflection probe (cubemap update, 0x4D7985) gets the car's
-//    blended position too; it used the raw 60 Hz physics position, so the
-//    reflections stepped against the smoothly drawn car.
-// v0.15.5: shift animation pacing reworked - every gear change is animated
-//    again (v0.15.4 skipped quick back-and-forth shifts, like the vanilla game
-//    skipping them). A change during a shift extends it: the hand stays at the
-//    shifter and returns ~0.5 s after the last change, instead of queueing.
-// v0.15.4: gear changes during a shift folded into it; quick back-and-forth
-//    shifts not animated (replaced in v0.15.5).
-// v0.15.3: fixed the driver sometimes repeating the gear-shift animation forever.
-//    The clip selector (0x42E6B0) ends a shift when the anim's "looped" flag is
-//    set; with fractional animation advances a later small advance could clear
-//    the flag before the selector looked. The flag is now a latch: set when a
-//    clip wraps, cleared only when the selector starts a new clip.
-// v0.15.2-interp: a camera whose view direction turns > 45 deg (or rolls, or
-//    whose fov jumps) within one step counts as a cut - look back on cameras
-//    that flip the same camera object was blended through the car.
-// v0.15.1-interp: a frame whose camera can't be blended (look back / camera
-//    switch / jump) now draws the cars un-blended too - they were a step away
-//    from the camera for a frame, which flickered when looking back.
-// v0.15 (based on v0.13.2):
-//  - Interpolation: racing cars and the camera are drawn between the game's
-//    60 Hz physics steps, so motion is smooth at any frame rate above 60.
-//    After every WorldStep (0x4D0370) the physics bodies of the cars drawn last
-//    frame (vehicle+0x6E8: pos +0x2A8, 3x3 +0x2B4) and each view's active camera
-//    (eye/target/fov/up) are snapshot. At render time CarModel::SetTransform
-//    (0x42B940, called from 0x4CA860 with the body's pose) and BuildView
-//    (0x40D620) get values blended between the snapshots around "display time
-//    minus interpDelay steps"; the camera is restored right after the view is
-//    built. Cars/cameras that don't match the newest snapshot (replays, resets,
-//    cameras changed outside a step) are drawn exactly as the game had them.
-//    The log counts car draws through two other paths (list B, sim-placed
-//    cars) that are not blended yet.
-//
-// Changes from v0.13.1:
-//  - Fixed the game speeding up when the frame cap can't be reached (e.g. a
-//    480 cap running at ~270 fps). Every missed deadline re-anchored the
-//    limiter, and every re-anchor let the tick scheduler fire the next tick as
-//    early as half a tick after the previous one - with re-anchors every few
-//    ms the 120 Hz sim ran up to ~2x. Now: re-locking never fires a tick
-//    earlier than one full tick after the last; free-running ticks keep their
-//    cadence across schedule changes; and when the limiter keeps missing its
-//    deadlines the ticks free-run until frames are on time again (2 s).
-//
-// Changes from v0.13:
-//  - Fixed knocked props flickering: the prop sync (0x433900) moves each prop
-//    onto a pending list (0x444F20); the renderer only draws objects that are
-//    in a grid cell, and the game re-files the pending list (0x444F80) right
-//    after its own sync. The even-step sync now does the same.
-//
-// Changes from v0.12:
-//  - smoothProps now targets the real knockable props. When hit, a prop gets a
-//    rigid body from a 40-entry pool (0x6E27A0). Its rendered transform is
-//    synced from the body (0x433900) only on odd physics steps, and bodies in
-//    the simplified integrator (0x444440, dt = 1/30) also only step on odd
-//    steps. The sync loop (0x4D8850) now also runs on even steps, and the
-//    simplified integrator runs every step with dt = 1/60. Collisions keep
-//    their original odd-step rate.
-//  - The v0.12 patch (0x41D760) turned out to be the particle/debris pool
-//    (smoke, sparks, crash debris); it is kept as smoothParticles.
-//
-// Changes from v0.11:
-//  - smoothParticles (was mislabelled smoothProps): the particle/debris pool
-//    at 0x6D42B0 integrates its motion in 0x41D760 using
-//    "half steps" (stepCounter >> 1), i.e. 30 Hz. The two halvings are removed
-//    and the 0.5 scale becomes 0.25, so they move every physics step at the
-//    same speed. Their collision/limit pass (0x41D020) keeps its original rate.
-//
-// Changes from v0.10:
-//  - smoothCharacterAnims: the per-physics-step world update (0x4D00A0) only
-//    runs character actors (drivers, cops, dog, the busted driver) on odd
-//    steps - "and bl, 1" - so every character animated at 30 Hz. The ASI now
-//    also runs the actor UpdateAll (0x406FB0) on even steps, hooked at the
-//    call at 0x4D0217. Other odd-step-only systems (particles etc.) keep their
-//    original rate. Animation advances by elapsed steps, so speed is unchanged.
-//  - Removed the experimental camera probe.
-//
-// Changes from v0.9:
-//  - Animation clock rewrite (AnimChannelSet::Advance, 0x545030). Character
-//    animations advanced in whole 60 Hz physics steps. Slow-motion cameras
-//    (e.g. the bust sequence) scale game time down to 0.25x, so the step
-//    counter - and every animation - only moved 15 times a second.
-//    smoothSlowMotionAnims advances channels by fractional steps taken from
-//    race time, so characters animate every frame at any game speed.
-//  - fixDriverShiftAnim: the driver's clip selector (0x42E6B0) treats the
-//    shift animation as finished when the channel set's "looped" flag is set.
-//    Advance left that flag untouched when no time had passed, so a stale
-//    flag (often from the steering clip) cancelled freshly started shift
-//    animations - the hand never left the wheel. The flag is now cleared
-//    whenever an update advances no time.
-//  - Log records game-speed (time scale) changes.
-//
-// Changes from v0.8:
-//  - smoothDriverSteering: the driver's steering-wheel pose (VehicleDriver,
-//    0x42E7C8) only updated every 4th 60 Hz physics step, i.e. 15 Hz, moving
-//    up to 0.1 of the range per update. It now updates every physics step
-//    with the step scaled down (0.025), so the wheel turns at the same speed
-//    but at 60 Hz. The shared 0.1 constant is left alone.
-//
-// Changes from v0.7.2:
+// What this ASI does:
+//  - Frame limiter: deadline-based, on a high-resolution waitable timer
+//    (enableLimiter, targetFPS); timeBeginPeriod(1); hiResGameTimers answers
+//    the game's GetTickCount / timeGetTime from QueryPerformanceCounter.
 //  - preciseGameTicks: the game simulates on a 120 Hz tick thread driven by a
 //    chain of one-shot timeSetEvent timers (callback 0x5DBA10 -> SetEvent ->
-//    tick thread increments 0x84C38C and runs the sim handlers). Windows'
-//    multimedia timer delivers those callbacks late and unevenly, so some
-//    rendered frames get 1 or 3 sim ticks instead of 2 (visible judder at a
-//    steady 60 fps). The ASI now replaces that timer with its own
-//    high-resolution scheduler. When the limiter runs at a rate that divides
-//    the tick rate (60, 30, 120...), ticks are phase-locked to the frame
-//    schedule so every frame gets exactly the same number of ticks.
-//  - Stats now include a ticks-per-frame histogram (e.g. 2:600 = perfect).
-//  - Correction: NFSHP2.exe does import Sleep (an earlier import listing was
-//    truncated); it is not involved in the loading or timing issues.
-//
-// Changes from v0.7.1:
-//  - Removed skipRapidPresents / rapidThresholdMs. Dropping presents that came
-//    soon after the previous one discarded real frames (the check ran before
-//    the limiter's wait), causing stutter; the limiter and clock fix cover it.
-//
-// Changes from v0.7:
-//  - HP2FrameFix.ini and HP2FrameFix.log now live next to the .asi (e.g. in a
-//    scripts\ folder) instead of next to the game exe.
-//
-// Changes from v0.6:
-//  - EAX fix. The game only enables EAX when the audio system (re)starts and
-//    only if the audio-mode option is 3 (EAX) at that moment. The menu calls
-//    RestartAudio() (0x446360) when the mode changes; nothing calls it after the
-//    saved profile is applied at startup. fixEAXOnStartup detects "option says
-//    EAX, engine has EAX off" on the front end and calls RestartAudio() once,
-//    which is exactly what the manual Stereo -> EAX toggle does.
-//  - Loading speed-up. Every load step calls Progress::Advance() (0x479C70),
-//    which renders and presents a full loading-screen frame each time, so load
-//    time is bounded by frame time. The render call is redirected so the screen
-//    is drawn at most every loadScreenRenderMs; the limiter is also bypassed
-//    while loading. Per-load stats are logged.
-//  - Removed the Sleep hooks (no effect on loading).
-//
-// Changes from v0.5:
-//  - timeBeginPeriod(1) always raised; hiResGameTimers answers the game's
-//    GetTickCount / timeGetTime from QueryPerformanceCounter.
-//
-// Changes from v0.4:
-//  - Deadline-based limiter with high-resolution waitable timer; stats average
-//    fixed; dead EAX code removed; checked VirtualProtect; serialized logging.
+//    tick thread increments 0x84C38C and runs the sim handlers), delivered late
+//    and unevenly. A high-resolution scheduler replaces it; with a frame cap
+//    that divides the tick rate the ticks are phase-locked to the frame
+//    schedule (tickPhase). Re-locking never fires a tick earlier than one full
+//    tick after the last, and ticks free-run while the limiter keeps missing
+//    its deadlines, so the simulation never runs fast.
+//  - fixEAXOnStartup (any audio mode): the sound engine reads the mode only
+//    when it starts, before the saved profile is applied; the profile apply
+//    (0x536BA0) copies the mode but never restarts the engine (the options menu
+//    does, 0x446360). If a loaded profile changes the mode of the running
+//    engine, it is restarted once.
+//  - speedUpLoading: every load step (Progress::Advance, 0x479C70) renders and
+//    presents a loading-screen frame; it is drawn at most every
+//    loadScreenRenderMs, and the limiter is bypassed while loading.
+//  - smoothDriverSteering: the steering-wheel pose (VehicleDriver, 0x42E7C8)
+//    updated every 4th physics step; it updates every step with a quarter of
+//    the step (0.025 instead of the shared 0.1).
+//  - smoothSlowMotionAnims: AnimChannelSet::Advance (0x545030) advances by
+//    fractional steps taken from race time instead of whole 60 Hz steps, so
+//    characters animate every frame in slow motion too (bust camera, 0.25x).
+//  - fixDriverShiftAnim: the clip selector (0x42E6B0) ends a shift when the
+//    channel set's "looped" flag is set; the flag is a latch (set when a clip
+//    wraps, cleared only when the selector starts a new clip). A gear change
+//    during a shift extends it; the hand returns ~0.5 s after the last change.
+//  - smoothCharacterAnims: the world update (0x4D00A0) runs character actors
+//    only on odd steps ("and bl, 1"); their UpdateAll (0x406FB0) also runs on
+//    even steps, hooked at 0x4D0217.
+//  - smoothParticles: the particle/debris pool (0x6D42B0) integrates in half
+//    steps in 0x41D760; it moves every physics step at the same speed. Its
+//    collision/limit pass (0x41D020) keeps its rate.
+//  - smoothProps: knocked props (rigid bodies from the pool at 0x6E27A0) are
+//    synced (0x4D8850 -> 0x433900) and integrated (0x444440, dt 1/60) every
+//    step, and re-filed into the grid cells the renderer draws (0x444F80).
+//    Collisions keep their odd-step rate.
+//  - interpolate: racing cars, the camera and the reflection probe are drawn
+//    between the 60 Hz physics steps (see the Interpolation section).
+//  - hdReflections: see the HD car reflections section.
+//  - widescreen: see the Widescreen section.
+//  - memoryPools: see the Memory pools section.
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
@@ -298,7 +137,7 @@ namespace hp2 {
         { 0x4444DE,       "\xD8\x0D\x90\xD6\x65\x00", 6 },
         { 0x4444F9,       "\xD8\x0D\x90\xD6\x65\x00", 6 },
         { 0x444517,       "\xD8\x0D\x90\xD6\x65\x00", 6 },
-        // interpolation (v0.15)
+        // interpolation
         { 0x4D0370,       "\xE8\x2B\xFD\xFF\xFF", 5 },                 // call WorldStep
         { 0x4CA968,       "\xE8\x13\x0F\xF6\xFF", 5 },                 // call CarModel::SetOwner
         { 0x4CA978,       "\xE8\xC3\x0F\xF6\xFF", 5 },                 // call CarModel::SetTransform
@@ -341,8 +180,8 @@ struct Config {
     int   limiterDuringLoading = 0;
     int   logToFile            = 1;
     int   logEveryNFrames      = 600;
-    // interpolation (v0.15)
-    // HD car reflections (v0.16, from NFSHP2 HD Reflections by Arctic94 / Aero_, GPL-3)
+    // interpolation
+    // HD car reflections (from NFSHP2 HD Reflections by Arctic94 / Aero_, GPL-3)
     int   hdReflections        = 1;
     int   reflAutoRes          = 1;     // 1080p 512, 1440p 1024, 2160p 2048
     int   reflCubemapRes       = 512;
@@ -356,7 +195,7 @@ struct Config {
     float interpDelay          = 1.0f;  // steps behind the newest step that frames are drawn
     float maxStepDistance      = 10.0f; // don't blend a jump bigger than this per step (resets, cuts)
     float maxStepAngle         = 90.0f;
-    // widescreen (v0.17)
+    // widescreen
     int   widescreen           = 1;
     int   wsCenterUI           = 1;     // menus/HUD: uniform scale, centered
     int   wsFixFOV             = 1;     // Hor+ 3D
@@ -367,7 +206,7 @@ struct Config {
     int   wsUnlockResolutions  = 1;
     int   wsLog                = 1;
     int   wsNoLetterbox        = 0;
-    // memory pools (v0.18, from HP2WSFix's [MEMORY] section)
+    // memory pools (from HP2WSFix's [MEMORY] section)
     int   memoryPools          = 0;
     float memGeneral           = 0;     // MB, 0 = automatic (game's spare room + all pools)
     float memRender            = 0;     // MB, 0 = game default
@@ -1557,7 +1396,7 @@ static unsigned long long g_presentCount = 0, g_intervalCount = 0;
 static double g_minDelta = 1e9, g_maxDelta = 0.0, g_sumDelta = 0.0;
 
 // ---------------------------------------------------------------------------
-// Interpolation (v0.15)
+// Interpolation
 //
 // The world steps at 60 Hz (WorldStep 0x4D00A0, called from 0x4D0370) and the
 // game draws whatever the last step left. Racing cars are re-posed at render
@@ -2052,7 +1891,7 @@ static void __fastcall Hook_ReflUpdate(void* mgr, void*, void* view, const float
                 // The update orients the sphere map toward the camera eye, read
                 // through the view (0x40CFD0). (Don't touch the body: the game
                 // caches the car's draw transform from it during this call.)
-                // (The blended camera stays in place for the whole frame since v0.16.3.)
+                // (The blended camera stays in place for the whole frame.)
                 const IpViewCam* vc = FindViewCam(reinterpret_cast<DWORD>(view));
                 if (vc && FindCamOverride(vc->cam)) g_ipReflCamBlended++;
                 orig(mgr, nullptr, view, bp);
@@ -2281,7 +2120,7 @@ static bool PatchIAT_Direct3DCreate8() {
 }
 
 // ---------------------------------------------------------------------------
-// HD car reflections (v0.16)
+// HD car reflections
 //
 // Patches from NFSHP2 HD Reflections by Arctic94 (fork of NFS HD Reflections by
 // Aero_), https://github.com/Arctic94/NFSHDReflections, GPL-3.0 - so this file,
@@ -2374,7 +2213,7 @@ static void InstallReflections() {
 }
 
 // ---------------------------------------------------------------------------
-// Widescreen (v0.17)
+// Widescreen
 //
 // Based on the findings of HP2WSFix by Lovro Pleše (xan1242) / hdbeefup,
 // https://github.com/hdbeefup/hp2wsfix - MIT License:
@@ -2946,7 +2785,7 @@ static void LogWidescreenStats() {
 }
 
 // ---------------------------------------------------------------------------
-// Memory pools (v0.18, from HP2WSFix's [MEMORY] section)
+// Memory pools (from HP2WSFix's [MEMORY] section)
 //
 // At startup (0x53BBC0, called from 0x537819) the game mallocs one general
 // heap and then carves fixed-size class pools out of it (0x53B9E0, each via
