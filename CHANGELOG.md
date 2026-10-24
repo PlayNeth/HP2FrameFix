@@ -17,6 +17,17 @@ Credits:
 
 ---
 
+## 0.19: portable
+
+- **Save folder (`saveFolder`, default `save`):** profiles and saves go in a folder inside the game folder, or a full path if you give one. They used to go in `Documents\EA Games\Need For Speed Hot Pursuit 2`.
+  - On the first run, existing profiles are copied over from Documents. The originals stay where they were.
+  - An empty `saveFolder=` keeps the game's default location.
+- **Registry (`portableRegistry=1`):** the game's own registry keys are kept in `HP2FrameFix_registry.ini`, next to the `.asi`, instead of the Windows registry.
+  - The keys covered are the install folder, the "installed from" folder (where the game looks for the music), the CD key and the GameSpy id.
+  - Both install folders default to the game folder, so the game works wherever it is copied.
+  - The CD key and GameSpy id are taken over from the Windows registry once, if they are there.
+  - The game no longer writes to the registry. Other programs' keys, such as Direct3D's, are left alone.
+
 ## 0.18.9: cleanup
 
 - **Weather mod cap removed:** NFSHP2 Weather Mod fixed its render-target check, so the cubemap cap and its module scan are gone. `reflWeatherModCap` no longer exists.
