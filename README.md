@@ -55,7 +55,7 @@ Almost everything can be switched off or adjusted in `HP2FrameFix.ini`.
 ### Frame rate and timing
 
 - **Even frame pacing:** a deadline-based frame limiter, and a precise scheduler in place of the game's uneven 120 Hz simulation timer. With a frame cap that divides the tick rate (60, 120…), every frame gets the same number of simulation steps, so a steady 60 fps no longer judders.
-- **Interpolation above 60 fps:** the game simulates at 60 Hz. Racing cars, the camera and the car reflections are drawn between physics steps, so motion is smooth at 120 Hz, 144 Hz and higher. Replays, resets and camera cuts are drawn exactly as the game has them.
+- **Interpolation above 60 fps:** the game simulates at 60 Hz. Racing cars, the camera and the car reflections are drawn between physics steps, so motion is smooth at 120 Hz, 144 Hz and higher. Replays and resets are drawn exactly as the game has them. A camera cut (look back, a camera switch) appears at its own step, without the picture jumping.
 
 ### Smoother animation
 
@@ -142,11 +142,11 @@ Almost everything can be switched off or adjusted in `HP2FrameFix.ini`.
 
 ## Building from source
 
-The source is a single file, `HP2FrameFix.cpp`, built with MinGW-w64, 32-bit:
+The source is `HP2FrameFix.cpp` and the files under `src/`: one `.cpp` for each area of the mod, each with a header (`.h`) for what the other files use. It is built with MinGW-w64, 32-bit, from the repository's folder:
 
 ```
 i686-w64-mingw32-g++ -std=c++17 -O2 -shared -s -static-libgcc -static-libstdc++ \
-  -o HP2FrameFix.asi HP2FrameFix.cpp -lwinmm -luser32
+  -o HP2FrameFix.asi HP2FrameFix.cpp src/*.cpp -lwinmm -luser32
 ```
 
 ## Credits

@@ -17,6 +17,16 @@ Credits:
 
 ---
 
+## 0.19.1: look back without the jump
+
+- **Camera cuts no longer jump.** Looking back, releasing it, and switching camera made the picture hitch for a frame.
+  - A frame the camera couldn't be blended in was drawn as the game had things at that moment. Every other frame is drawn one physics step behind, so that frame was a step ahead: the picture jumped forward, then back.
+  - Such a frame now keeps the earlier camera, moved along with the car it looks at, and the cars stay blended. The new view appears exactly at its step.
+- **Your car no longer jumps when you let go of look back.** This one is the game's: for the first step after look back, the chase camera sits closer to the car than it should, and a step later it's back at its distance. The game does the same without the mod.
+  - That first step isn't shown. The camera is drawn at its next step's place for it, moved back with the car.
+  - This needs `interpolate=1` and `interpolateCamera=1` (the defaults).
+- **Source:** the code is now split into files under `src/`, one for each area of the mod, each with a header. The build command names `src/*.cpp` as well; see the README.
+
 ## 0.19: portable
 
 - **Save folder (`saveFolder`, default `save`):** profiles and saves go in a folder inside the game folder, or a full path if you give one. They used to go in `Documents\EA Games\Need For Speed Hot Pursuit 2`.
